@@ -79,8 +79,9 @@ class Logger
 
     /**
      * @param array{method: string, path: string, headers?: array<string, string>, body?: mixed} $request
+     * @return string The correlation ID used to pair this request with a response
      */
-    public function logRequest(string $apiKey, array $request): void
+    public function logRequest(string $apiKey, array $request): string
     {
         $headers = $request['headers'] ?? [];
         $correlationId = $headers['x-correlation-id'] ?? Uuid::uuid4()->toString();
@@ -104,6 +105,8 @@ class Logger
         }
 
         $this->info($apiKey, 'Incoming request', $data);
+
+        return $correlationId;
     }
 
     /**
