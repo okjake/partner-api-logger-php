@@ -88,7 +88,8 @@ $logger->info($apiKey, 'Step 2');
 ### HTTP Request / Response Logging
 
 ```php
-$logger->logRequest($apiKey, [
+// logRequest returns the correlation ID for pairing with the response
+$correlationId = $logger->logRequest($apiKey, [
     'method' => $request->method(),
     'path' => $request->path(),
     'headers' => $request->headers->all(),
