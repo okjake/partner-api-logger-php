@@ -129,7 +129,7 @@ class Logger
     }
 
     /**
-     * @param array{slug: string, timestamp: string, value: int|float, period: string, metadata?: array<string, mixed>} $data
+     * @param array{slug: string, timestamp: string, value: int|float, period: string, series?: string, metadata?: array<string, mixed>} $data
      */
     public function metric(string $apiKey, array $data): void
     {
@@ -139,6 +139,10 @@ class Logger
             'period' => $data['period'],
         ];
 
+        if (isset($data['series'])) {
+            $point['series'] = $data['series'];
+        }
+
         if (isset($data['metadata'])) {
             $point['metadata'] = $data['metadata'];
         }
@@ -147,7 +151,7 @@ class Logger
     }
 
     /**
-     * @param array<array{timestamp: string, value: int|float, period: string, metadata?: array<string, mixed>}> $points
+     * @param array<array{timestamp: string, value: int|float, period: string, series?: string, metadata?: array<string, mixed>}> $points
      */
     public function metrics(string $apiKey, string $slug, array $points): void
     {
@@ -170,6 +174,18 @@ class Logger
 
         if (count($points) > 1000) {
             throw new LoggerException('Maximum 1000 points per request');
+        }
+
+        // Validate series on each point
+        foreach ($points as $i => $point) {
+            if (isset($point['series'])) {
+                if (!is_string($point['series']) || empty(trim($point['series']))) {
+                    throw new LoggerException("points[{$i}].series must be a non-empty string when provided");
+                }
+                if (strlen(trim($point['series'])) > 50) {
+                    throw new LoggerException("points[{$i}].series must be at most 50 characters");
+                }
+            }
         }
 
         try {
