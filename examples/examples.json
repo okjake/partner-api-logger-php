@@ -1,0 +1,44 @@
+[
+  {
+    "title": "Basic Logging",
+    "description": "Send info, warn, error, and debug log entries",
+    "language": "php",
+    "code": "<?php\nuse PartnerApi\\Logger\\Logger;\n\n$logger = new Logger(\n    tenantToken: '{{TENANT_TOKEN}}',\n    baseUrl: '{{BASE_URL}}'\n);\n\n$logger->info('{{API_KEY}}', 'User signed in', ['userId' => 'usr_123']);\n$logger->warn('{{API_KEY}}', 'Rate limit approaching', ['current' => 95, 'limit' => 100]);\n$logger->error('{{API_KEY}}', 'Payment failed', ['orderId' => 'ord_456']);\n$logger->debug('{{API_KEY}}', 'Cache miss', ['key' => 'user:123:profile']);",
+    "placeholders": ["{{TENANT_TOKEN}}", "{{BASE_URL}}", "{{API_KEY}}"]
+  },
+  {
+    "title": "Request/Response Logging",
+    "description": "Log HTTP requests and responses with correlation IDs",
+    "language": "php",
+    "code": "<?php\nuse PartnerApi\\Logger\\Logger;\n\n$logger = new Logger(\n    tenantToken: '{{TENANT_TOKEN}}',\n    baseUrl: '{{BASE_URL}}'\n);\n\n$correlationId = $logger->logRequest('{{API_KEY}}', [\n    'method' => 'POST',\n    'path' => '/api/reservations',\n    'headers' => ['content-type' => 'application/json'],\n]);\n\n// ... process the request ...\n\n$logger->logResponse('{{API_KEY}}', [\n    'statusCode' => 201,\n    'duration' => 245,\n    'correlationId' => $correlationId,\n]);",
+    "placeholders": ["{{TENANT_TOKEN}}", "{{BASE_URL}}", "{{API_KEY}}"]
+  },
+  {
+    "title": "Single Metric",
+    "description": "Send a single performance metric data point",
+    "language": "php",
+    "code": "<?php\nuse PartnerApi\\Logger\\Logger;\n\n$logger = new Logger(\n    tenantToken: '{{TENANT_TOKEN}}',\n    baseUrl: '{{BASE_URL}}'\n);\n\n$logger->metric('{{API_KEY}}', [\n    'slug' => 'revenue',\n    'timestamp' => '2026-03-01T00:00:00Z',\n    'value' => 54000,\n    'period' => 'Mar 01',\n    'metadata' => ['currency' => 'USD'],\n]);",
+    "placeholders": ["{{TENANT_TOKEN}}", "{{BASE_URL}}", "{{API_KEY}}"]
+  },
+  {
+    "title": "Batch Metrics",
+    "description": "Send multiple metric data points in a single request",
+    "language": "php",
+    "code": "<?php\nuse PartnerApi\\Logger\\Logger;\n\n$logger = new Logger(\n    tenantToken: '{{TENANT_TOKEN}}',\n    baseUrl: '{{BASE_URL}}'\n);\n\n$logger->metrics('{{API_KEY}}', 'revenue', [\n    ['timestamp' => '2026-03-01T00:00:00Z', 'value' => 54000, 'period' => 'Mar 01'],\n    ['timestamp' => '2026-03-08T00:00:00Z', 'value' => 55200, 'period' => 'Mar 08'],\n    ['timestamp' => '2026-03-15T00:00:00Z', 'value' => 58100, 'period' => 'Mar 15'],\n]);",
+    "placeholders": ["{{TENANT_TOKEN}}", "{{BASE_URL}}", "{{API_KEY}}"]
+  },
+  {
+    "title": "Multi-Series Metrics",
+    "description": "Send metric data points with series names",
+    "language": "php",
+    "code": "<?php\nuse PartnerApi\\Logger\\Logger;\n\n$logger = new Logger(\n    tenantToken: '{{TENANT_TOKEN}}',\n    baseUrl: '{{BASE_URL}}'\n);\n\n$logger->metrics('{{API_KEY}}', 'revenue', [\n    ['timestamp' => '2026-03-01T00:00:00Z', 'value' => 42000, 'period' => 'Mar 01', 'series' => 'EMEA'],\n    ['timestamp' => '2026-03-01T00:00:00Z', 'value' => 38000, 'period' => 'Mar 01', 'series' => 'APAC'],\n    ['timestamp' => '2026-03-01T00:00:00Z', 'value' => 55000, 'period' => 'Mar 01', 'series' => 'Americas'],\n]);",
+    "placeholders": ["{{TENANT_TOKEN}}", "{{BASE_URL}}", "{{API_KEY}}"]
+  },
+  {
+    "title": "Laravel Setup",
+    "description": "Register the logger as a Laravel service",
+    "language": "php",
+    "code": "<?php\n// In AppServiceProvider.php\nuse PartnerApi\\Logger\\Logger;\n\npublic function register(): void\n{\n    $this->app->singleton(Logger::class, function () {\n        return new Logger(\n            tenantToken: config('services.partner_api.tenant_token'),\n            baseUrl: config('services.partner_api.ingest_url'),\n        );\n    });\n}\n\n// Usage in a controller\npublic function store(Request $request, Logger $logger)\n{\n    $logger->info(config('services.partner_api.api_key'), 'Order created', [\n        'orderId' => $order->id,\n    ]);\n}",
+    "placeholders": []
+  }
+]
