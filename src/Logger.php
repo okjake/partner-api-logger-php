@@ -180,10 +180,10 @@ class Logger
         foreach ($points as $i => $point) {
             if (isset($point['series'])) {
                 if (!is_string($point['series']) || empty(trim($point['series']))) {
-                    throw new LoggerException("points[{$i}].series must be a non-empty string when provided");
+                    throw new LoggerException('series must be a non-empty string when provided');
                 }
                 if (strlen(trim($point['series'])) > 50) {
-                    throw new LoggerException("points[{$i}].series must be at most 50 characters");
+                    throw new LoggerException('series must be at most 50 characters');
                 }
             }
         }
