@@ -91,6 +91,8 @@ class Logger
             'path' => $request['path'],
             'requestId' => $headers['x-request-id'] ?? null,
             'correlationId' => $correlationId,
+            'statusCode' => null,
+            'duration' => null,
         ]);
 
         $data = [
