@@ -1,3 +1,5 @@
+<!-- doc-type: reference -->
+
 # Partner API Logger SDK for PHP
 
 Send structured logs and metrics to the Partner API ingest service.
