@@ -343,19 +343,8 @@ final class RedactPii
     }
 }
 
-/**
- * Procedural alias matching the TypeScript public surface:
- *
- * ```php
- * use function PartnerApi\Logger\redactPII;
- * $clean = redactPII('contact alice@example.com');
- * ```
- *
- * @param string|array<mixed>|int|float|bool|null $input
- * @param array<string, bool> $options
- * @return string|array<mixed>|int|float|bool|null
- */
-function redactPII(mixed $input, array $options = []): mixed
-{
-    return RedactPii::redact($input, $options);
-}
+// The procedural `redactPII()` alias lives in `src/functions.php`, which is
+// registered via `composer.json` → `autoload.files` so it is loaded eagerly.
+// PHP does not autoload functions, so PSR-4 alone would leave the documented
+// `use function PartnerApi\Logger\redactPII;` form undefined until the class
+// happened to be loaded for some other reason.

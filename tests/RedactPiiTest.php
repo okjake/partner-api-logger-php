@@ -23,6 +23,20 @@ class RedactPiiTest extends TestCase
         );
     }
 
+    public function testProceduralAliasIsAutoloadedNotClassSideEffect(): void
+    {
+        // Regression: PHP does not autoload functions, so PSR-4 alone left
+        // `PartnerApi\Logger\redactPII` undefined until `RedactPii` happened
+        // to be loaded for some other reason. With `autoload.files` wired up
+        // the function must exist purely from Composer's autoloader, without
+        // anything needing to reference the class first.
+        $this->assertTrue(
+            function_exists('PartnerApi\\Logger\\redactPII'),
+            'redactPII() must be registered via composer autoload.files so the '
+            . 'documented `use function` import works without first loading the class.',
+        );
+    }
+
     public function testStaticHelperRedactsEmails(): void
     {
         $this->assertSame(
