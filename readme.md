@@ -109,6 +109,59 @@ $logger->logResponse($apiKey, [
 
 Sensitive headers (`Authorization`, `Cookie`, `X-API-Key`, etc.) are automatically redacted.
 
+## PII Redaction Helper
+
+For call sites that need to redact PII before passing user data into a downstream system whose logs you don't control, the package exposes a public `redactPII()` helper. The ruleset mirrors what the ingest service applies internally — emails, JWTs, Bearer tokens, named API-key prefixes, passwords, phone numbers, credit cards, IPv4/IPv6 addresses, and URL query strings.
+
+```php
+use PartnerApi\Logger\RedactPii;
+use function PartnerApi\Logger\redactPII;
+
+// Strings (regex pass)
+redactPII('contact alice@example.com'); // → 'contact [EMAIL_REDACTED]'
+redactPII('Authorization: Bearer abc.def.ghi'); // → 'Authorization: Bearer [TOKEN_REDACTED]'
+
+// Headers (sensitive keys replaced wholesale)
+redactPII([
+    'Authorization' => 'Bearer secret',
+    'X-Api-Key'     => 'sk-livetestkey1234567890',
+    'Cookie'        => 'session=abc',
+]);
+// → ['Authorization' => 'Bearer [TOKEN_REDACTED]', 'X-Api-Key' => '[KEY_REDACTED]', 'Cookie' => '[COOKIE_REDACTED]']
+
+// JSON body / deeply nested arrays
+redactPII([
+    'user' => [
+        'email'       => 'alice@example.com',
+        'credentials' => ['password' => 'hunter2', 'refresh_token' => 'rt_xyz'],
+    ],
+]);
+// → ['user' => ['email' => '[EMAIL_REDACTED]', 'credentials' => ['password' => '[PASSWORD_REDACTED]', 'refresh_token' => '[TOKEN_REDACTED]']]]
+
+// Query strings (encoded as associative array)
+redactPII(['user' => 'alice', 'api_key' => 'sk-livetestkey1234567890']);
+// → ['user' => 'alice', 'api_key' => '[KEY_REDACTED]']
+```
+
+Use the static form `RedactPii::redact(...)` when a use-function import is awkward. Options:
+
+```php
+RedactPii::redact($input, [
+    'preserveStructure'   => true,  // keep sensitive keys with redacted placeholder (default true; false drops the key)
+    'redactEmails'        => true,
+    'redactApiKeys'       => true,
+    'redactTokens'        => true,
+    'redactPasswords'     => true,
+    'redactPhoneNumbers'  => true,
+    'redactCreditCards'   => true,
+    'redactIpAddresses'   => true,
+    'redactUrls'          => true,
+    'redactUuids'         => false, // off by default — opt in for log-line redaction
+]);
+```
+
+The original input is never mutated — a redacted copy is returned. Scalars (int/float/bool) and `null` pass through untouched.
+
 ## Metrics
 
 Send business metrics to track over time:
