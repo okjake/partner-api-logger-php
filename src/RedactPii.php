@@ -181,8 +181,11 @@ final class RedactPii
                 '[JWT_TOKEN_REDACTED]',
                 $sanitized,
             ) ?? $sanitized;
+            // Bearer tokens may include dots (JWT-shaped `abc.def.ghi`, opaque
+            // dotted tokens) — include `.` in the character class so the whole
+            // credential is consumed, not just the first segment.
             $sanitized = preg_replace(
-                '/\bBearer\s+[A-Za-z0-9_-]+/i',
+                '/\bBearer\s+[A-Za-z0-9._-]+/i',
                 'Bearer [TOKEN_REDACTED]',
                 $sanitized,
             ) ?? $sanitized;

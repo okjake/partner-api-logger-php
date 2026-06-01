@@ -48,6 +48,16 @@ class RedactPiiTest extends TestCase
         );
     }
 
+    public function testRedactsDottedBearerTokensInFull(): void
+    {
+        // Regression: the prior character class stopped at the first `.`,
+        // leaking the tail (`.def.ghi`) into sanitized output.
+        $this->assertSame(
+            'Authorization: Bearer [TOKEN_REDACTED]',
+            RedactPii::redact('Authorization: Bearer abc.def.ghi'),
+        );
+    }
+
     public function testRedactsNamedApiKeyPrefixes(): void
     {
         $this->assertStringContainsString(
