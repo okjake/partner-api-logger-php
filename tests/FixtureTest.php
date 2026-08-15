@@ -2,7 +2,10 @@
 
 namespace PartnerApi\Logger\Tests;
 
+use GuzzleHttp\Client;
 use GuzzleHttp\ClientInterface;
+use GuzzleHttp\Handler\MockHandler;
+use GuzzleHttp\HandlerStack;
 use PartnerApi\Logger\Logger;
 use PartnerApi\Logger\LoggerException;
 use PHPUnit\Framework\TestCase;
@@ -39,6 +42,49 @@ class FixtureTest extends TestCase
         // Build mock HTTP client
         $capturedRequests = [];
         $mockError = $setup['mockHttpError'] ?? null;
+        $mockStatus = $setup['mockHttpStatus'] ?? null;
+
+        // A status-code fixture goes through a REAL Guzzle client wired to a
+        // MockHandler, not the ClientInterface double below. The behaviour
+        // under test is Guzzle's own `http_errors` handling — the thing that
+        // makes a non-2xx raise — and a hand-rolled double would assert our
+        // assumption about Guzzle rather than Guzzle itself.
+        if ($mockStatus !== null) {
+            $handler = HandlerStack::create(
+                new MockHandler([new \GuzzleHttp\Psr7\Response($mockStatus, [], '{}')])
+            );
+            $statusClient = new Client(['handler' => $handler]);
+
+            $logger = new Logger(
+                tenantToken: $setup['config']['tenantToken'],
+                baseUrl: $setup['config']['baseUrl'] ?? null,
+                httpClient: $statusClient,
+                timestampProvider: fn () => $setup['mockTimestamp'] ?? 1234567890000,
+            );
+
+            foreach ($setup['context'] ?? [] as $ctx) {
+                $logger->setContext($ctx);
+            }
+
+            $statusError = null;
+            try {
+                $this->executeAction($logger, $action);
+            } catch (LoggerException $e) {
+                $statusError = $e;
+            }
+
+            if (isset($expect['errorPrefix'])) {
+                $this->assertNotNull(
+                    $statusError,
+                    "Expected a failure for HTTP {$mockStatus}, got none",
+                );
+                $this->assertStringStartsWith($expect['errorPrefix'], $statusError->getMessage());
+            } else {
+                $this->assertNull($statusError);
+            }
+
+            return;
+        }
 
         $httpClient = $this->createMock(ClientInterface::class);
         $requestExpectation = $httpClient->method('request');
@@ -94,6 +140,11 @@ class FixtureTest extends TestCase
         if (isset($expect['error'])) {
             $this->assertNotNull($error, "Expected error: {$expect['error']}");
             $this->assertSame($expect['error'], $error->getMessage());
+        } elseif (isset($expect['errorPrefix'])) {
+            // Prefix-only: the wrapper text is contractual across languages,
+            // the underlying HTTP client's message is not.
+            $this->assertNotNull($error, "Expected error prefixed: {$expect['errorPrefix']}");
+            $this->assertStringStartsWith($expect['errorPrefix'], $error->getMessage());
         } else {
             if ($error) {
                 throw $error;
