@@ -29,6 +29,20 @@ return [
     // default), which lets a blackholed ingest hang the flush.
     'request_timeout_ms' => (int) env('PARTNER_API_LOG_REQUEST_TIMEOUT_MS', 5000),
 
+    // The deadline for the ONE drain a caller ever waits on: the batch_size
+    // trigger, which runs inside a log call. One attempt, no backoff, and a
+    // retryable failure is handed back to the buffer instead of retried here.
+    // This is the most a single log call can cost the request.
+    'auto_drain_timeout_ms' => (int) env('PARTNER_API_LOG_AUTO_DRAIN_TIMEOUT_MS', 1000),
+
+    // Total budget for one flush()/terminate/shutdown drain, across every
+    // group, chunk, retry and backoff. 0 disables the bound. The shutdown
+    // drain runs inside the FPM request that already answered the client, so
+    // keep this well under the pool's request_terminate_timeout — otherwise
+    // FPM kills the worker mid-drain and the buffer dies with it. Entries
+    // still undelivered when it runs out are reported as 'drain-timeout'.
+    'drain_deadline_ms' => (int) env('PARTNER_API_LOG_DRAIN_DEADLINE_MS', 5000),
+
     // Drain anything still buffered from a register_shutdown_function, as a
     // fallback for requests that never reach Laravel's terminate() path.
     'flush_on_shutdown' => (bool) env('PARTNER_API_LOG_FLUSH_ON_SHUTDOWN', true),

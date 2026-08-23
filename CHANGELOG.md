@@ -5,8 +5,11 @@
 ## 2.0.0
 
 Buffered, non-throwing delivery (PAPI-3672), bringing the PHP SDK to parity
-with `@partner-api/logger` 3.0.0. Telemetry can no longer break, slow or fail
-the partner request it describes.
+with `@partner-api/logger` 3.0.0. Telemetry can no longer break or fail the
+partner request it describes, and what it can cost that request is bounded and
+configurable: **at most `autoDrainTimeoutMs` (1 s) per request** on the request
+path, and **at most `drainDeadlineMs` (5 s)** for the drain that runs after the
+response has been sent. See "What this costs your request" in the readme.
 
 ### Breaking
 
@@ -27,11 +30,24 @@ the partner request it describes.
 - **Failed batches are retried** — network faults, 408, 429 and 5xx, with
   equal-jitter exponential backoff, up to `maxRetries` (default 3). Any other
   4xx is dropped without a retry. `['maxRetries' => 0]` restores
-  single-attempt behaviour.
-- **Requests now carry a 5 s deadline** (`requestTimeoutMs`). Guzzle's default
-  is no timeout at all, which let a blackholed ingest hang the flush — and, in
-  1.x, the caller's request with it. `['requestTimeoutMs' => 0]` restores the
-  old unbounded behaviour.
+  single-attempt behaviour. Retries run only in `flush()` and the
+  end-of-request drain, never on the request path.
+- **Drains are time-bounded.** The `batchSize` drain is the only one a caller
+  waits on, and it is best-effort: one attempt on `autoDrainTimeoutMs`
+  (default 1000), no backoff sleep, and a retryable failure hands the chunk
+  back to the buffer rather than retrying inline. It then latches off for the
+  rest of the request, so N log calls cannot cost N timeouts.
+  `flush()` / `shutdown()` / the end-of-request drain are bounded as a whole
+  by `drainDeadlineMs` (default 5000), with each attempt clamped to what is
+  left of it. This matters on PHP-FPM, where the shutdown drain runs inside
+  the request that already answered the client and therefore counts against
+  `request_terminate_timeout`. `['drainDeadlineMs' => 0]` removes the bound.
+- **Requests now carry a 5 s deadline** (`requestTimeoutMs`), **including the
+  `/metrics` POST**. Guzzle's default is no timeout at all, which let a
+  blackholed ingest hang the flush — and, in 1.x, the caller's request with it.
+  A metrics call that used to take 8 s and succeed now raises
+  `LoggerException`. `['requestTimeoutMs' => 0]` restores the old unbounded
+  behaviour.
 - **An unknown constructor option raises.** A typo in `$options` would
   otherwise silently leave a production default in place.
 
@@ -40,17 +56,21 @@ the partner request it describes.
 - `$options` — a fifth constructor argument carrying `mode`, `onError`,
   `maxBufferSize` (1000), `batchSize` (100), `maxRetries` (3),
   `retryBaseDelayMs` (200), `retryMaxDelayMs` (5000), `requestTimeoutMs`
-  (5000), `flushOnShutdown` (true), `finishRequestOnShutdown` (true), plus
-  `sleeper` / `randomizer` test seams. The four existing arguments are
-  unchanged and still positional/named.
+  (5000), `autoDrainTimeoutMs` (1000), `drainDeadlineMs` (5000),
+  `flushOnShutdown` (true), `finishRequestOnShutdown` (true), plus
+  `sleeper` / `randomizer` / `clock` test seams. The four existing arguments
+  are unchanged and still positional/named.
 - `PartnerApi\Logger\LoggerErrorEvent` — passed to `onError` for every drop,
-  with a `reason` of `flush-failed`, `buffer-overflow` or `invalid-entry`, plus
-  `message`, `entryCount`, `droppedTotal` and, where they apply, `status`,
-  `attempts`, `retryable` and `cause`. `message` is exactly the string 1.x
-  would have thrown, so anything matching on that text still matches. The
-  default hook is one `error_log()` of it — the same line 1.x wrote to stderr.
-- `flush()`, `shutdown()`, `close()` and `stats()`
-  (`['buffered' => …, 'delivered' => …, 'dropped' => …]`).
+  with a `reason` of `flush-failed`, `buffer-overflow`, `invalid-entry` or
+  `drain-timeout`, plus `message`, `entryCount`, `droppedTotal` and, where they
+  apply, `status`, `attempts`, `retryable` and `cause`. `drain-timeout` is
+  PHP-only — the TypeScript SDK drains on an event loop and needs no
+  wall-clock budget. `message` is exactly the string 1.x would have thrown, so
+  anything matching on that text still matches, and `drain-timeout` keeps the
+  same `Failed to send log: …` prefix. The default hook is one `error_log()`
+  of it — the same line 1.x wrote to stderr.
+- `flush()` (bounded by `drainDeadlineMs`), `shutdown()`, `close()` and
+  `stats()` (`['buffered' => …, 'delivered' => …, 'dropped' => …]`).
 - `Logger::MODE_DIRECT` — the 1.x profile, synchronous and throwing, for
   consumers that genuinely need a per-call receipt. `examples/log-data.php`
   uses it; application code should not.
@@ -72,7 +92,8 @@ the partner request it describes.
   `logRequest` — it just no longer costs a round-trip.
 - `metric` / `metrics`: still synchronous, still raise `LoggerException` on
   failure. A metric submission is an explicit write the caller is entitled to
-  a receipt for.
+  a receipt for. Note that `requestTimeoutMs` applies to them too — see
+  Breaking.
 - `redactPII` / `RedactPii`.
 - The request body, headers and `Failed to send log: …` wording — now carried
   on the reported event rather than on a thrown exception.

@@ -25,6 +25,8 @@ class LoggerServiceProvider extends ServiceProvider
                     'retryBaseDelayMs' => (int) ($config['retry_base_delay_ms'] ?? 200),
                     'retryMaxDelayMs' => (int) ($config['retry_max_delay_ms'] ?? 5000),
                     'requestTimeoutMs' => (int) ($config['request_timeout_ms'] ?? 5000),
+                    'autoDrainTimeoutMs' => (int) ($config['auto_drain_timeout_ms'] ?? 1000),
+                    'drainDeadlineMs' => (int) ($config['drain_deadline_ms'] ?? 5000),
                     'flushOnShutdown' => (bool) ($config['flush_on_shutdown'] ?? true),
                     'finishRequestOnShutdown' => (bool) ($config['finish_request_on_shutdown'] ?? true),
                 ],

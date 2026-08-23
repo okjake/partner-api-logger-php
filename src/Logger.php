@@ -14,12 +14,12 @@ use Ramsey\Uuid\Uuid;
  * `packages/logger-spec/spec.md`: `info()` / `warn()` / `error()` / `debug()` /
  * `logRequest()` / `logResponse()` append to an in-process buffer and **never
  * throw**. Nothing about our ingest — an outage, a slow round-trip, a 500 —
- * can any longer fail or slow down the partner request the log describes.
+ * can any longer fail the partner request the log describes.
  *
  * PHP has no event loop, so a buffered SDK needs an explicit end-of-request
  * drain. There are three:
  *
- * 1. `flush()` — deliver everything buffered at call time. Always available.
+ * 1. `flush()` — deliver what is buffered at call time. Always available.
  * 2. `batchSize` — reaching it drains automatically (default 100 entries).
  * 3. A `register_shutdown_function` hook, armed on the first buffered entry.
  *    It calls `fastcgi_finish_request()` first where the SAPI provides it, so
@@ -28,6 +28,21 @@ use Ramsey\Uuid\Uuid;
  * Under Laravel the service provider additionally registers a `terminating`
  * callback, which runs earlier than the shutdown hook and works on long-lived
  * workers (Octane, queues) where per-request shutdown functions never fire.
+ *
+ * **What a caller can be made to wait for.** Only (2) runs inside a log call,
+ * and it is deliberately cheap: one attempt, bounded by `autoDrainTimeoutMs`
+ * (default 1000 ms), no backoff sleep, and a chunk that failed for a
+ * retryable reason goes back on the buffer rather than being retried on the
+ * request path. A failed auto-drain then latches off for the rest of the
+ * request, so N log calls cannot cost N timeouts. So a single log call blocks
+ * for at most `autoDrainTimeoutMs`, and a whole request for at most that once.
+ *
+ * (1) and (3) carry the retries, and are bounded as a whole by
+ * `drainDeadlineMs` (default 5000 ms). That matters most for (3): it runs
+ * inside the same FPM request as the response it already sent, so an
+ * unbounded drain would be killed by `request_terminate_timeout` mid-flight.
+ * Keep `drainDeadlineMs` well under that setting. Entries still undelivered
+ * when the budget runs out are reported as `drain-timeout` and dropped.
  *
  * The pre-2.0 synchronous behaviour — POST on the call, raise on failure — is
  * still reachable with `['mode' => Logger::MODE_DIRECT]`.
@@ -64,6 +79,29 @@ class Logger
     private const DEFAULT_RETRY_BASE_DELAY_MS = 200;
     private const DEFAULT_RETRY_MAX_DELAY_MS = 5000;
     private const DEFAULT_REQUEST_TIMEOUT_MS = 5000;
+    private const DEFAULT_AUTO_DRAIN_TIMEOUT_MS = 1000;
+    private const DEFAULT_DRAIN_DEADLINE_MS = 5000;
+
+    /**
+     * Which drain is running, which is what decides how much time the caller
+     * is allowed to spend.
+     *
+     * - `DIRECT`  — `MODE_DIRECT`: one attempt, raises at the call site.
+     * - `AUTO`    — the `batchSize` trigger, running *inside* a log call. One
+     *   attempt, its own short timeout, no backoff sleep; a still-retryable
+     *   chunk goes back on the buffer for `FULL` to deal with later.
+     * - `FULL`    — `flush()` / `shutdown()` / the end-of-request hook. Retries,
+     *   bounded as a whole by `drainDeadlineMs`.
+     */
+    private const DRAIN_DIRECT = 'direct';
+    private const DRAIN_AUTO = 'auto';
+    private const DRAIN_FULL = 'full';
+
+    /** What became of one chunk. */
+    private const OUTCOME_DELIVERED = 'delivered';
+    private const OUTCOME_DROPPED = 'dropped';
+    private const OUTCOME_REQUEUE = 'requeue';
+    private const OUTCOME_ABANDONED = 'abandoned';
 
     /**
      * Recognised `$options` keys. A typo in a constructor option would
@@ -81,10 +119,13 @@ class Logger
         'retryBaseDelayMs',
         'retryMaxDelayMs',
         'requestTimeoutMs',
+        'autoDrainTimeoutMs',
+        'drainDeadlineMs',
         'flushOnShutdown',
         'finishRequestOnShutdown',
         'sleeper',
         'randomizer',
+        'clock',
     ];
 
     private const SENSITIVE_HEADERS = [
@@ -113,6 +154,9 @@ class Logger
     /** @var callable(): float */
     private $randomizer;
 
+    /** @var callable(): float Monotonic milliseconds, for drain budgets. */
+    private $clock;
+
     private string $mode;
     private int $maxBufferSize;
     private int $batchSize;
@@ -120,6 +164,8 @@ class Logger
     private int $retryBaseDelayMs;
     private int $retryMaxDelayMs;
     private int $requestTimeoutMs;
+    private int $autoDrainTimeoutMs;
+    private int $drainDeadlineMs;
     private bool $flushOnShutdown;
     private bool $finishRequestOnShutdown;
 
@@ -128,6 +174,14 @@ class Logger
 
     private bool $shutdownArmed = false;
     private bool $draining = false;
+
+    /**
+     * Latched when a request-path drain fails, so the *next* log call past
+     * `batchSize` does not pay another `autoDrainTimeoutMs` to discover the
+     * same outage. Cleared by a full drain that delivers everything.
+     */
+    private bool $autoDrainSuppressed = false;
+
     private int $deliveredTotal = 0;
     private int $droppedTotal = 0;
 
@@ -141,10 +195,13 @@ class Logger
      *     retryBaseDelayMs?: int,
      *     retryMaxDelayMs?: int,
      *     requestTimeoutMs?: int,
+     *     autoDrainTimeoutMs?: int,
+     *     drainDeadlineMs?: int,
      *     flushOnShutdown?: bool,
      *     finishRequestOnShutdown?: bool,
      *     sleeper?: callable(int): void,
-     *     randomizer?: callable(): float
+     *     randomizer?: callable(): float,
+     *     clock?: callable(): float
      * } $options
      *
      * - `mode` — `Logger::MODE_BUFFERED` (default) or `Logger::MODE_DIRECT`.
@@ -160,19 +217,33 @@ class Logger
      *   request handler that wants exactly one POST at the end.
      * - `maxRetries` — retries after the first attempt, per batch (default 3).
      *   Only network faults, 408, 429 and 5xx are retried; any other 4xx is a
-     *   bad request and is dropped immediately. Ignored in direct mode, where
-     *   a retry would be a sleep on the caller's request path.
+     *   bad request and is dropped immediately. Applies to `flush()` and the
+     *   end-of-request drain only: the `batchSize` drain runs inside a log call
+     *   and never retries inline, and direct mode never retries at all.
      * - `retryBaseDelayMs` / `retryMaxDelayMs` — equal-jitter backoff window
      *   (defaults 200 / 5000).
      * - `requestTimeoutMs` — per-request deadline (default 5000; `0` disables).
      *   Guzzle has no timeout by default, so without this a blackholed ingest
      *   hangs the flush — and in direct mode, the request itself.
+     * - `autoDrainTimeoutMs` — the per-request deadline for the `batchSize`
+     *   drain, which is the only drain a caller waits on (default 1000). This
+     *   is the SDK's whole budget for one log call: one attempt, no backoff
+     *   sleep, and a still-retryable chunk goes back on the buffer for the
+     *   end-of-request drain rather than being retried on the request path.
+     * - `drainDeadlineMs` — total wall-clock budget for one `flush()` /
+     *   `shutdown()` / end-of-request drain, across every group, chunk, retry
+     *   and backoff (default 5000; `0` disables the bound). Whatever is still
+     *   undelivered when it runs out is reported as `drain-timeout` and
+     *   dropped. Bounds the drain that runs inside the FPM request after
+     *   `fastcgi_finish_request()` — keep it well under the pool's
+     *   `request_terminate_timeout`, or FPM kills the worker mid-drain.
      * - `flushOnShutdown` — arm the `register_shutdown_function` drain
      *   (default true).
      * - `finishRequestOnShutdown` — call `fastcgi_finish_request()` before that
      *   drain where the SAPI has it (default true), so delivery happens after
      *   the client already has its response.
-     * - `sleeper` / `randomizer` — backoff seams for tests.
+     * - `sleeper` / `randomizer` / `clock` — backoff and deadline seams for
+     *   tests. `clock` returns monotonic milliseconds.
      */
     public function __construct(
         string $tenantToken,
@@ -219,6 +290,11 @@ class Logger
             (int) ($options['retryMaxDelayMs'] ?? self::DEFAULT_RETRY_MAX_DELAY_MS),
         );
         $this->requestTimeoutMs = max(0, (int) ($options['requestTimeoutMs'] ?? self::DEFAULT_REQUEST_TIMEOUT_MS));
+        $this->autoDrainTimeoutMs = max(
+            0,
+            (int) ($options['autoDrainTimeoutMs'] ?? self::DEFAULT_AUTO_DRAIN_TIMEOUT_MS),
+        );
+        $this->drainDeadlineMs = max(0, (int) ($options['drainDeadlineMs'] ?? self::DEFAULT_DRAIN_DEADLINE_MS));
         $this->flushOnShutdown = (bool) ($options['flushOnShutdown'] ?? true);
         $this->finishRequestOnShutdown = (bool) ($options['finishRequestOnShutdown'] ?? true);
 
@@ -228,6 +304,10 @@ class Logger
             }
         };
         $this->randomizer = $options['randomizer'] ?? static fn (): float => mt_rand() / mt_getrandmax();
+
+        // hrtime() is monotonic: a drain budget must not be moved by an NTP
+        // step or a leap second the way microtime() can be.
+        $this->clock = $options['clock'] ?? static fn (): float => hrtime(true) / 1e6;
     }
 
     /**
@@ -346,13 +426,31 @@ class Logger
     }
 
     /**
-     * Delivers everything buffered at call time.
+     * Delivers what is buffered at call time, within `drainDeadlineMs`.
      *
      * Never throws — failures go to `onError`. Call it wherever entries must
      * have landed before the process moves on: the end of a request handler, a
      * shutdown path, before a long sleep in a worker.
+     *
+     * The budget is the point. This drain runs synchronously, and at shutdown
+     * it runs inside the FPM request that already answered the client; without
+     * a bound, an unreachable ingest costs
+     * `(1 + maxRetries) × requestTimeoutMs + backoff` *per group*, which sails
+     * past a typical `request_terminate_timeout` and gets the worker killed
+     * mid-drain. Anything still undelivered when the budget runs out is
+     * reported as `drain-timeout` and dropped.
      */
     public function flush(): void
+    {
+        $this->drain(self::DRAIN_FULL);
+    }
+
+    /**
+     * Takes the buffer and posts it under the given drain profile.
+     *
+     * @param self::DRAIN_AUTO|self::DRAIN_FULL $profile
+     */
+    private function drain(string $profile): void
     {
         // `onError` runs inside the drain; a hook that logs through this same
         // logger would otherwise re-enter and post the batch it is reporting on.
@@ -364,17 +462,67 @@ class Logger
         $this->buffer = [];
         $this->draining = true;
 
+        // `0` disables the bound; an AUTO drain is bounded by its own
+        // single-attempt timeout instead, so it needs no wall-clock budget.
+        $deadline = ($profile === self::DRAIN_FULL && $this->drainDeadlineMs > 0)
+            ? $this->clockMs() + $this->drainDeadlineMs
+            : null;
+
         try {
+            $pending = [];
             foreach ($this->group($batch) as $group) {
                 foreach ($this->chunk($group) as $chunk) {
-                    $this->postBatch($chunk, false);
+                    $pending[] = $chunk;
                 }
+            }
+
+            $requeue = [];
+            $delivered = true;
+
+            while ($pending !== []) {
+                $chunk = array_shift($pending);
+
+                if ($deadline !== null && $this->clockMs() >= $deadline) {
+                    array_unshift($pending, $chunk);
+                    $this->abandon($pending);
+                    $delivered = false;
+                    break;
+                }
+
+                $outcome = $this->postBatch($chunk, $profile, $deadline);
+
+                if ($outcome === self::OUTCOME_REQUEUE) {
+                    // Still worth another go, but not on the caller's clock.
+                    foreach ($chunk as $queued) {
+                        $requeue[] = $queued;
+                    }
+                    $delivered = false;
+                } elseif ($outcome === self::OUTCOME_ABANDONED) {
+                    array_unshift($pending, $chunk);
+                    $this->abandon($pending);
+                    $delivered = false;
+                    break;
+                } elseif ($outcome === self::OUTCOME_DROPPED) {
+                    $delivered = false;
+                }
+            }
+
+            if ($requeue !== []) {
+                $this->rebuffer($requeue);
+            }
+
+            if ($profile === self::DRAIN_AUTO && !$delivered) {
+                // Latch: the next log call past `batchSize` must not pay
+                // another timeout to rediscover the same outage.
+                $this->autoDrainSuppressed = true;
+            } elseif ($profile === self::DRAIN_FULL && $delivered) {
+                $this->autoDrainSuppressed = false;
             }
         } catch (\Throwable $e) {
             // Belt and braces. `postBatch()` already swallows every delivery
             // failure, so reaching here means something outside that contract
-            // threw — a caller-supplied `sleeper`, most plausibly. `flush()`
-            // runs from a shutdown function and from the log path, and an
+            // threw — a caller-supplied `sleeper` or `clock`, most plausibly.
+            // This runs from a shutdown function and from the log path, and an
             // exception escaping either is precisely the failure this SDK
             // exists to keep away from the partner's request.
             $this->report(new LoggerErrorEvent(
@@ -390,6 +538,58 @@ class Logger
         } finally {
             $this->draining = false;
         }
+    }
+
+    /**
+     * Reports and discards chunks the drain budget left undelivered.
+     *
+     * @param list<list<array<string, mixed>>> $chunks
+     */
+    private function abandon(array $chunks): void
+    {
+        $count = 0;
+        foreach ($chunks as $chunk) {
+            $count += count($chunk);
+        }
+
+        if ($count === 0) {
+            return;
+        }
+
+        $this->droppedTotal += $count;
+        $this->report(new LoggerErrorEvent(
+            LoggerErrorEvent::REASON_DRAIN_TIMEOUT,
+            sprintf(
+                'Failed to send log: drain deadline exceeded (%d ms) — dropped %d undelivered %s',
+                $this->drainDeadlineMs,
+                $count,
+                $count === 1 ? 'entry' : 'entries',
+            ),
+            $count,
+            $this->droppedTotal,
+            null,
+            null,
+            true,
+        ));
+    }
+
+    /**
+     * Returns entries an auto-drain could not deliver to the front of the
+     * buffer — they are older than anything logged since — for the
+     * end-of-request drain to retry properly.
+     *
+     * @param list<array<string, mixed>> $entries
+     */
+    private function rebuffer(array $entries): void
+    {
+        $this->buffer = array_merge($entries, $this->buffer);
+        $this->trimBuffer();
+    }
+
+    /** Monotonic milliseconds. */
+    private function clockMs(): float
+    {
+        return ($this->clock)();
     }
 
     /**
@@ -492,7 +692,7 @@ class Logger
             $this->post('/metrics', $apiKey, [
                 'slug' => $slug,
                 'points' => $points,
-            ]);
+            ], $this->requestTimeoutMs);
         } catch (\Throwable $e) {
             $message = $e->getMessage();
             error_log("Failed to send metrics: {$message}");
@@ -523,35 +723,48 @@ class Logger
         }
 
         if ($this->mode === self::MODE_DIRECT) {
-            $this->postBatch([$queued], true);
+            $this->postBatch([$queued], self::DRAIN_DIRECT);
             return;
         }
 
         $this->armShutdownFlush();
         $this->buffer[] = $queued;
+        $this->trimBuffer();
 
+        if (
+            $this->batchSize > 0
+            && !$this->autoDrainSuppressed
+            && count($this->buffer) >= $this->batchSize
+        ) {
+            // Best-effort, and the only drain the caller ever waits on. One
+            // attempt, `autoDrainTimeoutMs`, no backoff sleep — see drain().
+            $this->drain(self::DRAIN_AUTO);
+        }
+    }
+
+    /** Enforces `maxBufferSize`, dropping oldest-first and reporting. */
+    private function trimBuffer(): void
+    {
         $overflow = count($this->buffer) - $this->maxBufferSize;
-        if ($overflow > 0) {
-            // Drop the oldest: under sustained backpressure the newest entries
-            // are the ones describing what is going wrong right now.
-            array_splice($this->buffer, 0, $overflow);
-            $this->droppedTotal += $overflow;
-            $this->report(new LoggerErrorEvent(
-                LoggerErrorEvent::REASON_BUFFER_OVERFLOW,
-                sprintf(
-                    'Log buffer full (%d) — dropped %d oldest %s',
-                    $this->maxBufferSize,
-                    $overflow,
-                    $overflow === 1 ? 'entry' : 'entries',
-                ),
-                $overflow,
-                $this->droppedTotal,
-            ));
+        if ($overflow <= 0) {
+            return;
         }
 
-        if ($this->batchSize > 0 && count($this->buffer) >= $this->batchSize) {
-            $this->flush();
-        }
+        // Drop the oldest: under sustained backpressure the newest entries
+        // are the ones describing what is going wrong right now.
+        array_splice($this->buffer, 0, $overflow);
+        $this->droppedTotal += $overflow;
+        $this->report(new LoggerErrorEvent(
+            LoggerErrorEvent::REASON_BUFFER_OVERFLOW,
+            sprintf(
+                'Log buffer full (%d) — dropped %d oldest %s',
+                $this->maxBufferSize,
+                $overflow,
+                $overflow === 1 ? 'entry' : 'entries',
+            ),
+            $overflow,
+            $this->droppedTotal,
+        ));
     }
 
     /**
@@ -768,12 +981,18 @@ class Logger
     }
 
     /**
-     * Posts one batch, retrying transient failures, then gives up and reports.
+     * Posts one batch under the given drain profile.
+     *
+     * Only `DRAIN_FULL` retries, and only within `$deadline`. `DRAIN_AUTO`
+     * takes exactly one short attempt and hands a still-retryable chunk back
+     * for later; `DRAIN_DIRECT` takes one attempt and raises.
      *
      * @param list<array<string, mixed>> $chunk
-     * @param bool $throw Direct mode: raise instead of reporting, single attempt.
+     * @param self::DRAIN_* $profile
+     * @param float|null $deadline Monotonic ms after which a FULL drain stops.
+     * @return self::OUTCOME_*
      */
-    private function postBatch(array $chunk, bool $throw): void
+    private function postBatch(array $chunk, string $profile, ?float $deadline = null): string
     {
         $first = $chunk[0];
         $body = ['labels' => $first['labels']];
@@ -786,9 +1005,9 @@ class Logger
 
         for ($attempt = 0; ; $attempt++) {
             try {
-                $this->post('/logs', $first['apiKey'], $body);
+                $this->post('/logs', $first['apiKey'], $body, $this->timeoutFor($profile, $deadline));
                 $this->deliveredTotal += $count;
-                return;
+                return self::OUTCOME_DELIVERED;
             } catch (\Throwable $e) {
                 $status = $this->statusOf($e);
                 // 429 and 5xx say "come back later" — ingest collapses Loki
@@ -800,15 +1019,34 @@ class Logger
                     || $status === 429
                     || $status >= 500;
 
-                if (!$throw && $retryable && $attempt < $this->maxRetries) {
-                    ($this->sleeper)($this->backoffDelayMs($attempt));
+                if ($profile === self::DRAIN_FULL && $retryable && $attempt < $this->maxRetries) {
+                    $delay = $this->backoffDelayMs($attempt);
+
+                    if ($deadline !== null) {
+                        $remaining = $deadline - $this->clockMs();
+                        // No budget for the sleep, let alone the attempt after
+                        // it: stop here and let the drain report the rest.
+                        if ($remaining <= $delay) {
+                            return self::OUTCOME_ABANDONED;
+                        }
+                    }
+
+                    ($this->sleeper)($delay);
                     continue;
+                }
+
+                if ($profile === self::DRAIN_AUTO && $retryable) {
+                    // Worth another go, but not on the caller's clock. Back on
+                    // the buffer for the end-of-request drain, which runs after
+                    // the response has already been sent. Deliberately NOT
+                    // counted as dropped — nothing has been lost yet.
+                    return self::OUTCOME_REQUEUE;
                 }
 
                 // v1 wording, kept so anything matching on it still matches.
                 $message = 'Failed to send log: ' . $e->getMessage();
 
-                if ($throw) {
+                if ($profile === self::DRAIN_DIRECT) {
                     error_log($message);
                     throw new LoggerException($message);
                 }
@@ -824,9 +1062,38 @@ class Logger
                     $retryable,
                     $e,
                 ));
-                return;
+                return self::OUTCOME_DROPPED;
             }
         }
+    }
+
+    /**
+     * The per-request deadline for one attempt under this profile.
+     *
+     * A FULL drain's own `requestTimeoutMs` is clamped to what is left of the
+     * drain budget — otherwise a blackholed ingest would spend a full
+     * `requestTimeoutMs` past the budget on every group, which is exactly the
+     * overrun the budget exists to prevent.
+     */
+    private function timeoutFor(string $profile, ?float $deadline): int
+    {
+        if ($profile === self::DRAIN_AUTO) {
+            return $this->autoDrainTimeoutMs;
+        }
+
+        if ($deadline === null) {
+            return $this->requestTimeoutMs;
+        }
+
+        $remaining = (int) max(0, $deadline - $this->clockMs());
+
+        // `requestTimeoutMs: 0` disables the per-request deadline, but the
+        // drain budget still bounds the attempt.
+        if ($this->requestTimeoutMs <= 0) {
+            return max(1, $remaining);
+        }
+
+        return max(1, min($this->requestTimeoutMs, $remaining));
     }
 
     /**
@@ -853,8 +1120,9 @@ class Logger
 
     /**
      * @param array<string, mixed> $body
+     * @param int $timeoutMs Per-request deadline; `0` leaves Guzzle unbounded.
      */
-    private function post(string $path, string $apiKey, array $body): void
+    private function post(string $path, string $apiKey, array $body, int $timeoutMs): void
     {
         $options = [
             'json' => $body,
@@ -865,11 +1133,11 @@ class Logger
             ],
         ];
 
-        if ($this->requestTimeoutMs > 0) {
+        if ($timeoutMs > 0) {
             // Guzzle defaults to no timeout at all: a blackholed ingest would
             // otherwise hang the flush, and in direct mode the caller with it.
-            $options['timeout'] = $this->requestTimeoutMs / 1000;
-            $options['connect_timeout'] = $this->requestTimeoutMs / 1000;
+            $options['timeout'] = $timeoutMs / 1000;
+            $options['connect_timeout'] = $timeoutMs / 1000;
         }
 
         $this->httpClient->request('POST', "{$this->baseUrl}{$path}", $options);

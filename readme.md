@@ -19,8 +19,10 @@ composer require partner-api/logger
 Log calls **buffer and never throw**. `info()` / `warn()` / `error()` /
 `debug()` / `logRequest()` / `logResponse()` append to an in-process queue and
 return immediately; the queue is delivered after your response has been sent.
-Our ingest being slow or down cannot slow down or fail the request you are
-logging.
+Our ingest being slow or down cannot fail the request you are logging, and the
+time it can cost that request is bounded — see
+[What this costs your request](#what-this-costs-your-request) for the exact
+numbers.
 
 Upgrading from 1.x, two things change for you:
 
@@ -44,6 +46,41 @@ synchronously and still throws `LoggerException` on failure.
 
 Need the 1.x behaviour — a POST per call, an exception on failure? Pass
 `['mode' => Logger::MODE_DIRECT]` (see [Options](#options)).
+
+## What this costs your request
+
+Delivery is synchronous — PHP has no event loop to hand it to — so "buffered"
+has to mean *bounded*, not *free*. Two budgets do that, and nothing else in the
+SDK blocks:
+
+| | Runs | Worst case |
+| --- | --- | --- |
+| **A single log call** | drain 2, only once `batchSize` is reached | `autoDrainTimeoutMs` — **1 s** by default |
+| **Whole request, log calls only** | — | `autoDrainTimeoutMs`, once |
+| **End-of-request drain** | drains 1 and 3, after the response is sent | `drainDeadlineMs` — **5 s** by default |
+
+The request-path drain is deliberately cheap: **one** attempt on a short
+deadline, **no** backoff sleep, and a chunk that failed for a retryable reason
+goes back on the buffer instead of being retried while your caller waits. If it
+fails it latches off for the rest of the request, so N log calls can never cost
+N timeouts.
+
+The retries live in the end-of-request drain, where they cost your caller
+nothing, and `drainDeadlineMs` bounds that drain *as a whole* — every group,
+chunk, retry and backoff, with each individual attempt clamped to whatever is
+left of the budget. Entries still undelivered when it runs out are reported to
+`onError` with reason `drain-timeout` and dropped.
+
+> **PHP-FPM:** the end-of-request drain runs inside the same FPM request as the
+> response it already sent, so it counts against `request_terminate_timeout`.
+> Keep `drainDeadlineMs` comfortably under that value (the default 5 s sits
+> well inside a typical 30 s) or FPM will kill the worker mid-drain and the
+> buffer dies with it. Note that `max_execution_time` will *not* save you here:
+> on Unix its timer does not tick during a blocking socket wait.
+
+Set `drainDeadlineMs => 0` to opt out of the bound entirely, and
+`batchSize => 0` to opt out of the request-path drain entirely (one POST at the
+end of the request, and log calls that never touch the network).
 
 ## Laravel Setup
 
@@ -116,6 +153,8 @@ $logger = new Logger(
         'retryBaseDelayMs' => 200,
         'retryMaxDelayMs' => 5000,
         'requestTimeoutMs' => 5000, // 0 disables (Guzzle's own default: no deadline)
+        'autoDrainTimeoutMs' => 1000, // the most ONE log call can cost the request
+        'drainDeadlineMs' => 5000,    // total budget for a flush / end-of-request drain; 0 disables
         'flushOnShutdown' => true,
         'finishRequestOnShutdown' => true,
     ],
@@ -274,7 +313,11 @@ $logger = new Logger(
     tenantToken: 'tenant_live_xxxxxxxxxxxx',
     options: [
         'onError' => function (LoggerErrorEvent $event): void {
-            // $event->reason: 'flush-failed' | 'buffer-overflow' | 'invalid-entry'
+            // $event->reason:
+            //   'flush-failed'    — a batch was refused and discarded
+            //   'buffer-overflow' — maxBufferSize reached, oldest dropped
+            //   'invalid-entry'   — the call itself was unusable
+            //   'drain-timeout'   — drainDeadlineMs ran out, remainder dropped
             // $event->message is the exact string 1.x would have thrown
             // ('Failed to send log: …', 'API key is required for logging')
             // $event->entryCount / ->droppedTotal / ->status / ->attempts

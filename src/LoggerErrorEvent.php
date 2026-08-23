@@ -27,6 +27,18 @@ final class LoggerErrorEvent
     public const REASON_INVALID_ENTRY = 'invalid-entry';
 
     /**
+     * A drain ran out of its `drainDeadlineMs` budget with entries still
+     * undelivered, and discarded them.
+     *
+     * PHP-only. The TypeScript SDK drains on an event loop and needs no
+     * wall-clock budget; here the drain is synchronous and runs inside the FPM
+     * request, so it must be bounded or the worker is killed mid-drain. A
+     * handler that does not know this reason still gets the `Failed to send
+     * log: …` prefix on `message`.
+     */
+    public const REASON_DRAIN_TIMEOUT = 'drain-timeout';
+
+    /**
      * @param string          $reason       One of the REASON_* constants.
      * @param string          $message      Human-readable description; safe to log verbatim.
      * @param int             $entryCount   How many log entries this event cost you.
