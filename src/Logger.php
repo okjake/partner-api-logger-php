@@ -279,24 +279,36 @@ class Logger
         $headers = $request['headers'] ?? [];
         $correlationId = $headers['x-correlation-id'] ?? Uuid::uuid4()->toString();
 
-        $this->setContext([
-            'method' => $request['method'],
-            'path' => $request['path'],
-            'requestId' => $headers['x-request-id'] ?? null,
-            'correlationId' => $correlationId,
-            'statusCode' => null,
-            'duration' => null,
-        ]);
+        // `$request` is the caller's array. A missing `method` / `path` is only
+        // a warning here — until the host framework promotes warnings to
+        // `ErrorException`, which Laravel does, at which point a malformed
+        // argument escapes a log call that promises never to throw.
+        try {
+            $this->setContext([
+                'method' => $request['method'],
+                'path' => $request['path'],
+                'requestId' => $headers['x-request-id'] ?? null,
+                'correlationId' => $correlationId,
+                'statusCode' => null,
+                'duration' => null,
+            ]);
 
-        $data = [
-            'method' => $request['method'],
-            'path' => $request['path'],
-            'headers' => $this->redactHeaders($headers),
-            'correlation_id' => $correlationId,
-        ];
+            $data = [
+                'method' => $request['method'],
+                'path' => $request['path'],
+                'headers' => $this->redactHeaders($headers),
+                'correlation_id' => $correlationId,
+            ];
 
-        if (array_key_exists('body', $request)) {
-            $data['body'] = $request['body'];
+            if (array_key_exists('body', $request)) {
+                $data['body'] = $request['body'];
+            }
+        } catch (\Throwable $e) {
+            $this->reject('Failed to send log: request could not be described: ' . $e->getMessage());
+
+            // The caller still gets a usable ID to pair its response with —
+            // losing the entry must not also lose the correlation.
+            return $correlationId;
         }
 
         $this->info($apiKey, 'Incoming request', $data);
@@ -309,18 +321,28 @@ class Logger
      */
     public function logResponse(string $apiKey, array $response): void
     {
-        $this->setContext([
-            'statusCode' => $response['statusCode'],
-            'duration' => $response['duration'],
-        ]);
+        // See `logRequest()`: a malformed `$response` must be reported, not
+        // raised at a caller that was promised a non-throwing log call.
+        try {
+            $this->setContext([
+                'statusCode' => $response['statusCode'],
+                'duration' => $response['duration'],
+            ]);
 
-        $this->info($apiKey, 'Outgoing response', [
-            'status_code' => $response['statusCode'],
-            'headers' => isset($response['headers']) ? $this->redactHeaders($response['headers']) : null,
-            'body' => $response['body'] ?? null,
-            'duration_ms' => $response['duration'],
-            'correlation_id' => $response['correlationId'],
-        ]);
+            $data = [
+                'status_code' => $response['statusCode'],
+                'headers' => isset($response['headers']) ? $this->redactHeaders($response['headers']) : null,
+                'body' => $response['body'] ?? null,
+                'duration_ms' => $response['duration'],
+                'correlation_id' => $response['correlationId'],
+            ];
+        } catch (\Throwable $e) {
+            $this->reject('Failed to send log: response could not be described: ' . $e->getMessage());
+
+            return;
+        }
+
+        $this->info($apiKey, 'Outgoing response', $data);
     }
 
     /**
@@ -482,7 +504,8 @@ class Logger
      * Builds one log entry and either buffers it or (direct mode) posts it.
      *
      * In buffered mode this never throws: a missing API key, unserialisable
-     * data, a full buffer and a dead ingest all surface through `onError`.
+     * data, data that raises while being serialised, a full buffer and a dead
+     * ingest all surface through `onError`.
      *
      * @param array<string, mixed> $data
      */
@@ -494,63 +517,10 @@ class Logger
             return;
         }
 
-        $timestampMs = ($this->timestampProvider)();
-        $timestampNs = bcmul((string) $timestampMs, '1000000');
-
-        $contextDefaults = array_filter([
-            'request_id' => $this->context['requestId'] ?? null,
-            'path' => $this->context['path'] ?? null,
-            'method' => $this->context['method'] ?? null,
-            'status_code' => $this->context['statusCode'] ?? null,
-            'duration_ms' => $this->context['duration'] ?? null,
-            'correlation_id' => $this->context['correlationId'] ?? null,
-        ], fn ($v) => $v !== null);
-
-        $lineBase = ['level' => $level, 'message' => $message];
-        if (($this->context['partnerId'] ?? null) !== null) {
-            $lineBase['partnerId'] = $this->context['partnerId'];
-        }
-
-        // Merge context defaults (nulls already filtered) then user data (preserve nulls)
-        $lineData = array_merge($lineBase, $contextDefaults, $data);
-
-        // `$data` is whatever the caller passed. Invalid UTF-8 or a recursive
-        // structure makes `json_encode` return false — which, before 2.0.0,
-        // shipped a literal `false` as the log line.
-        $line = json_encode($lineData, JSON_UNESCAPED_SLASHES);
-        if ($line === false) {
-            $this->reject('Failed to send log: log entry could not be serialised: ' . json_last_error_msg());
+        $queued = $this->buildEntry($apiKey, $level, $message, $data);
+        if ($queued === null) {
             return;
         }
-
-        // Labels and upstream attribution are snapshotted here, not at drain
-        // time — a later `setContext` must not retro-label queued entries.
-        $labels = ['level' => $level];
-        if (isset($this->context['partnerId'])) {
-            $labels['partnerId'] = $this->context['partnerId'];
-        }
-        // PAPI-687: direction rides in labels so ingest can promote it to a
-        // Loki stream label. Omitted when unset — ingest defaults to 'inbound'.
-        if (isset($this->context['direction'])) {
-            $labels['direction'] = $this->context['direction'];
-        }
-
-        // PAPI-687: upstream attribution is request-level, not a stream label
-        // (base URLs are high-cardinality). Ingest folds these into the line.
-        $root = [];
-        if (isset($this->context['upstreamIntegration'])) {
-            $root['upstream_integration'] = $this->context['upstreamIntegration'];
-        }
-        if (isset($this->context['upstreamBaseUrl'])) {
-            $root['upstream_base_url'] = $this->context['upstreamBaseUrl'];
-        }
-
-        $queued = [
-            'apiKey' => $apiKey,
-            'labels' => $labels,
-            'root' => $root,
-            'entry' => ['timestamp' => $timestampNs, 'line' => $line],
-        ];
 
         if ($this->mode === self::MODE_DIRECT) {
             $this->postBatch([$queued], true);
@@ -582,6 +552,101 @@ class Logger
         if ($this->batchSize > 0 && count($this->buffer) >= $this->batchSize) {
             $this->flush();
         }
+    }
+
+    /**
+     * Builds one queued entry, or reports the reason it could not be built and
+     * returns null.
+     *
+     * Everything here runs on the caller's request path over the caller's own
+     * values: a `JsonSerializable` in `$data` whose `jsonSerialize()` raises,
+     * a supplied `timestampProvider` that raises, a `bcmul()` that is not
+     * there because ext-bcmath is not installed. `json_encode` returning
+     * `false` was already handled; an *exception* thrown out of any of it was
+     * not, and would have escaped a log method whose entire contract is that
+     * it never throws. So construction is guarded as a unit.
+     *
+     * @param array<string, mixed> $data
+     * @return array<string, mixed>|null
+     */
+    private function buildEntry(string $apiKey, string $level, string $message, array $data): ?array
+    {
+        try {
+            return $this->composeEntry($apiKey, $level, $message, $data);
+        } catch (LoggerException $e) {
+            // Direct mode's own raise, from `reject()` below. Already the
+            // right exception with the right message — do not re-wrap it.
+            throw $e;
+        } catch (\Throwable $e) {
+            $this->reject('Failed to send log: log entry could not be built: ' . $e->getMessage());
+
+            return null;
+        }
+    }
+
+    /**
+     * @param array<string, mixed> $data
+     * @return array<string, mixed>|null
+     */
+    private function composeEntry(string $apiKey, string $level, string $message, array $data): ?array
+    {
+        $timestampMs = ($this->timestampProvider)();
+        $timestampNs = bcmul((string) $timestampMs, '1000000');
+
+        $contextDefaults = array_filter([
+            'request_id' => $this->context['requestId'] ?? null,
+            'path' => $this->context['path'] ?? null,
+            'method' => $this->context['method'] ?? null,
+            'status_code' => $this->context['statusCode'] ?? null,
+            'duration_ms' => $this->context['duration'] ?? null,
+            'correlation_id' => $this->context['correlationId'] ?? null,
+        ], fn ($v) => $v !== null);
+
+        $lineBase = ['level' => $level, 'message' => $message];
+        if (($this->context['partnerId'] ?? null) !== null) {
+            $lineBase['partnerId'] = $this->context['partnerId'];
+        }
+
+        // Merge context defaults (nulls already filtered) then user data (preserve nulls)
+        $lineData = array_merge($lineBase, $contextDefaults, $data);
+
+        // `$data` is whatever the caller passed. Invalid UTF-8 or a recursive
+        // structure makes `json_encode` return false — which, before 2.0.0,
+        // shipped a literal `false` as the log line.
+        $line = json_encode($lineData, JSON_UNESCAPED_SLASHES);
+        if ($line === false) {
+            $this->reject('Failed to send log: log entry could not be serialised: ' . json_last_error_msg());
+            return null;
+        }
+
+        // Labels and upstream attribution are snapshotted here, not at drain
+        // time — a later `setContext` must not retro-label queued entries.
+        $labels = ['level' => $level];
+        if (isset($this->context['partnerId'])) {
+            $labels['partnerId'] = $this->context['partnerId'];
+        }
+        // PAPI-687: direction rides in labels so ingest can promote it to a
+        // Loki stream label. Omitted when unset — ingest defaults to 'inbound'.
+        if (isset($this->context['direction'])) {
+            $labels['direction'] = $this->context['direction'];
+        }
+
+        // PAPI-687: upstream attribution is request-level, not a stream label
+        // (base URLs are high-cardinality). Ingest folds these into the line.
+        $root = [];
+        if (isset($this->context['upstreamIntegration'])) {
+            $root['upstream_integration'] = $this->context['upstreamIntegration'];
+        }
+        if (isset($this->context['upstreamBaseUrl'])) {
+            $root['upstream_base_url'] = $this->context['upstreamBaseUrl'];
+        }
+
+        return [
+            'apiKey' => $apiKey,
+            'labels' => $labels,
+            'root' => $root,
+            'entry' => ['timestamp' => $timestampNs, 'line' => $line],
+        ];
     }
 
     /**

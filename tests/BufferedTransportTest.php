@@ -258,6 +258,111 @@ class BufferedTransportTest extends TestCase
         );
     }
 
+    public function testDataThatRaisesWhileSerialisingIsReportedNotThrown(): void
+    {
+        $logger = $this->logger();
+
+        // `json_encode` returns false for invalid UTF-8, but it *propagates*
+        // an exception thrown out of `jsonSerialize()` — and partners pass
+        // models and DTOs into `$data` all the time.
+        $logger->info(self::KEY, 'bad', ['model' => new ThrowsWhenSerialised()]);
+        $logger->flush();
+
+        $this->assertSame([], $this->captured);
+        $this->assertCount(1, $this->reported);
+        $this->assertSame(LoggerErrorEvent::REASON_INVALID_ENTRY, $this->reported[0]->reason);
+        $this->assertSame(
+            'Failed to send log: log entry could not be built: cannot serialise this',
+            $this->reported[0]->message,
+        );
+        $this->assertSame(1, $logger->stats()['dropped']);
+    }
+
+    public function testARaisingTimestampProviderIsReportedNotThrown(): void
+    {
+        $logger = new Logger(
+            tenantToken: 'tenant',
+            httpClient: $this->transport([]),
+            timestampProvider: fn () => throw new \RuntimeException('clock unavailable'),
+            options: [
+                'flushOnShutdown' => false,
+                'onError' => function (LoggerErrorEvent $event): void {
+                    $this->reported[] = $event;
+                },
+            ],
+        );
+
+        $logger->info(self::KEY, 'a');
+
+        $this->assertCount(1, $this->reported);
+        $this->assertSame(LoggerErrorEvent::REASON_INVALID_ENTRY, $this->reported[0]->reason);
+        $this->assertStringEndsWith('clock unavailable', $this->reported[0]->message);
+    }
+
+    public function testAMalformedLogRequestIsReportedNotThrown(): void
+    {
+        $logger = $this->logger();
+
+        // Laravel promotes PHP warnings to ErrorException, so a missing
+        // `method` key stops being a notice and starts being a throw.
+        set_error_handler(static function (int $no, string $str, string $file, int $line): bool {
+            throw new \ErrorException($str, 0, $no, $file, $line);
+        });
+
+        try {
+            $correlationId = $logger->logRequest(self::KEY, ['path' => '/users']);
+        } finally {
+            restore_error_handler();
+        }
+
+        $logger->flush();
+
+        $this->assertNotSame('', $correlationId, 'the caller still gets a correlation ID');
+        $this->assertSame([], $this->captured);
+        $this->assertCount(1, $this->reported);
+        $this->assertSame(LoggerErrorEvent::REASON_INVALID_ENTRY, $this->reported[0]->reason);
+        $this->assertStringStartsWith(
+            'Failed to send log: request could not be described: ',
+            $this->reported[0]->message,
+        );
+    }
+
+    public function testAMalformedLogResponseIsReportedNotThrown(): void
+    {
+        $logger = $this->logger();
+
+        set_error_handler(static function (int $no, string $str, string $file, int $line): bool {
+            throw new \ErrorException($str, 0, $no, $file, $line);
+        });
+
+        try {
+            $logger->logResponse(self::KEY, ['statusCode' => 200]);
+        } finally {
+            restore_error_handler();
+        }
+
+        $logger->flush();
+
+        $this->assertSame([], $this->captured);
+        $this->assertCount(1, $this->reported);
+        $this->assertStringStartsWith(
+            'Failed to send log: response could not be described: ',
+            $this->reported[0]->message,
+        );
+    }
+
+    public function testDirectModeStillRaisesWhenAnEntryCannotBeBuilt(): void
+    {
+        $logger = $this->logger(['mode' => Logger::MODE_DIRECT]);
+
+        $this->expectException(LoggerException::class);
+        $this->expectExceptionMessage(
+            'Failed to send log: log entry could not be built: cannot serialise this',
+        );
+
+        $logger->info(self::KEY, 'bad', ['model' => new ThrowsWhenSerialised()]);
+    }
+
     public function testATransportFailureNeverReachesTheCaller(): void
     {
         $logger = $this->logger(
@@ -534,5 +639,14 @@ class BufferedTransportTest extends TestCase
     private function body(int $index): array
     {
         return $this->captured[$index]['options']['json'];
+    }
+}
+
+/** Stands in for an Eloquent model or DTO that raises on serialisation. */
+final class ThrowsWhenSerialised implements \JsonSerializable
+{
+    public function jsonSerialize(): mixed
+    {
+        throw new \LogicException('cannot serialise this');
     }
 }
