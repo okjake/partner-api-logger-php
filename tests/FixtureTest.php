@@ -7,9 +7,25 @@ use GuzzleHttp\ClientInterface;
 use GuzzleHttp\Handler\MockHandler;
 use GuzzleHttp\HandlerStack;
 use PartnerApi\Logger\Logger;
+use PartnerApi\Logger\LoggerErrorEvent;
 use PartnerApi\Logger\LoggerException;
 use PHPUnit\Framework\TestCase;
 
+/**
+ * Runs the shared cross-language fixtures in `packages/logger-spec/fixtures`.
+ *
+ * The fixtures are written in the **direct** style — "the call throws" — while
+ * the PHP SDK has been a **buffered** implementation since 2.0.0 (PAPI-3672).
+ * The fixtures stay language-neutral; this runner adapts, per "Notes for
+ * fixture runners" in `packages/logger-spec/spec.md`:
+ *
+ * - retries off, so one mocked failure is exactly one attempt;
+ * - the end-of-request shutdown drain off, so nothing touches a PHPUnit mock
+ *   after the test that built it has finished;
+ * - failures collected through `onError`, with the first one treated as the
+ *   fixture's expected raise;
+ * - an explicit `flush()` between the action and any assertion on the wire.
+ */
 class FixtureTest extends TestCase
 {
     private const UUID_PATTERN = '/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i';
@@ -55,11 +71,13 @@ class FixtureTest extends TestCase
             );
             $statusClient = new Client(['handler' => $handler]);
 
+            $statusReported = [];
             $logger = new Logger(
                 tenantToken: $setup['config']['tenantToken'],
                 baseUrl: $setup['config']['baseUrl'] ?? null,
                 httpClient: $statusClient,
                 timestampProvider: fn () => $setup['mockTimestamp'] ?? 1234567890000,
+                options: $this->fixtureOptions($statusReported),
             );
 
             foreach ($setup['context'] ?? [] as $ctx) {
@@ -72,6 +90,9 @@ class FixtureTest extends TestCase
             } catch (LoggerException $e) {
                 $statusError = $e;
             }
+
+            $logger->flush();
+            $statusError ??= $this->firstReportedAsError($statusReported);
 
             if (isset($expect['errorPrefix'])) {
                 $this->assertNotNull(
@@ -116,11 +137,13 @@ class FixtureTest extends TestCase
 
         // Create logger with mock timestamp
         $mockTimestamp = $setup['mockTimestamp'] ?? 1234567890000;
+        $reported = [];
         $logger = new Logger(
             tenantToken: $setup['config']['tenantToken'],
             baseUrl: $setup['config']['baseUrl'] ?? null,
             httpClient: $httpClient,
             timestampProvider: fn () => $mockTimestamp,
+            options: $this->fixtureOptions($reported),
         );
 
         // Apply context
@@ -135,6 +158,13 @@ class FixtureTest extends TestCase
         } catch (LoggerException $e) {
             $error = $e;
         }
+
+        // Deliver whatever the action buffered before asserting on the wire.
+        $logger->flush();
+
+        // A reported failure is this implementation's equivalent of the raise
+        // the fixture describes.
+        $error ??= $this->firstReportedAsError($reported);
 
         // Assert error expectation
         if (isset($expect['error'])) {
@@ -185,6 +215,36 @@ class FixtureTest extends TestCase
         } elseif (array_key_exists('request', $expect) && $expect['request'] === null) {
             $this->assertEmpty($capturedRequests, 'Expected no HTTP request to be made');
         }
+    }
+
+    /**
+     * The buffered-runner adaptation from spec.md's "Notes for fixture
+     * runners". `$reported` is taken by reference so the hook fills the
+     * caller's array.
+     *
+     * @param list<LoggerErrorEvent> $reported
+     * @return array<string, mixed>
+     */
+    private function fixtureOptions(array &$reported): array
+    {
+        return [
+            // One mocked failure must be one attempt: the fixtures describe a
+            // single call, not a retry policy.
+            'maxRetries' => 0,
+            // Nothing may touch a PHPUnit mock after its test has finished.
+            'flushOnShutdown' => false,
+            'onError' => function (LoggerErrorEvent $event) use (&$reported): void {
+                $reported[] = $event;
+            },
+        ];
+    }
+
+    /**
+     * @param list<LoggerErrorEvent> $reported
+     */
+    private function firstReportedAsError(array $reported): ?LoggerException
+    {
+        return $reported === [] ? null : new LoggerException($reported[0]->message);
     }
 
     private function executeAction(Logger $logger, array $action): void
