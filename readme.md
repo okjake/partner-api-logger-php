@@ -14,6 +14,37 @@ Send structured logs and metrics to the Partner API ingest service.
 composer require partner-api/logger
 ```
 
+## Delivery: buffered since 2.0.0
+
+Log calls **buffer and never throw**. `info()` / `warn()` / `error()` /
+`debug()` / `logRequest()` / `logResponse()` append to an in-process queue and
+return immediately; the queue is delivered after your response has been sent.
+Our ingest being slow or down cannot slow down or fail the request you are
+logging.
+
+Upgrading from 1.x, two things change for you:
+
+- **A `try`/`catch` around a log call no longer catches anything.** Delivery
+  failures go to the `onError` callable (see [Error Handling](#error-handling)).
+- **"The call returned" no longer means "delivered."** The buffer drains:
+  1. when it reaches `batchSize` (default 100 entries),
+  2. when you call `flush()`,
+  3. at the end of the request, from a `register_shutdown_function` — after
+     `fastcgi_finish_request()` where the SAPI provides it, so the client
+     already has its response. Under Laravel a `terminating` callback drains it
+     slightly earlier, which also covers Octane and queue workers.
+
+  Call `flush()` yourself anywhere entries must have landed before the process
+  moves on — a worker loop iteration, a long-running artisan command, or just
+  before a deliberate `exit`.
+
+`metric()` / `metrics()` are **not** buffered: a metric submission is an
+explicit write you are entitled to a receipt for, so it still posts
+synchronously and still throws `LoggerException` on failure.
+
+Need the 1.x behaviour — a POST per call, an exception on failure? Pass
+`['mode' => Logger::MODE_DIRECT]` (see [Options](#options)).
+
 ## Laravel Setup
 
 The package auto-discovers in Laravel. Publish the config file:
@@ -61,6 +92,44 @@ $logger = new Logger(
     tenantToken: 'tenant_live_xxxxxxxxxxxx',
     baseUrl: 'https://ingest.partnerapi.com', // optional, this is the default
 );
+
+// ... log during the request ...
+
+// Optional: the shutdown hook does this for you at the end of a web request.
+$logger->flush();
+```
+
+## Options
+
+A fifth constructor argument tunes the buffered transport. Every key is
+optional.
+
+```php
+$logger = new Logger(
+    tenantToken: 'tenant_live_xxxxxxxxxxxx',
+    options: [
+        'mode' => Logger::MODE_BUFFERED, // or Logger::MODE_DIRECT for the 1.x profile
+        'onError' => fn (LoggerErrorEvent $e) => Log::warning($e->message),
+        'batchSize' => 100,   // buffered entries that trigger a drain; 0 = only flush()/shutdown
+        'maxBufferSize' => 1000,  // entries held before the OLDEST are dropped
+        'maxRetries' => 3,     // retries per batch on network faults / 408 / 429 / 5xx
+        'retryBaseDelayMs' => 200,
+        'retryMaxDelayMs' => 5000,
+        'requestTimeoutMs' => 5000, // 0 disables (Guzzle's own default: no deadline)
+        'flushOnShutdown' => true,
+        'finishRequestOnShutdown' => true,
+    ],
+);
+```
+
+Under Laravel these are all `config/partner-logger.php` keys
+(`mode`, `batch_size`, `max_buffer_size`, `max_retries`, …) with matching
+`PARTNER_API_LOG_*` environment variables.
+
+### Buffer counters
+
+```php
+$logger->stats(); // ['buffered' => 12, 'delivered' => 480, 'dropped' => 0]
 ```
 
 ## Logging
@@ -86,6 +155,12 @@ $logger->setContext([
 $logger->info($apiKey, 'Step 1');
 $logger->info($apiKey, 'Step 2');
 ```
+
+Recognised keys: `partnerId`, `requestId`, `correlationId`, `path`, `method`,
+`statusCode`, `duration`, plus `direction` (`'inbound'` / `'outbound'`),
+`upstreamIntegration` and `upstreamBaseUrl` for attributing calls your tenant
+makes to an upstream integration. Context is snapshotted when the entry is
+buffered, so a later `setContext()` never re-labels entries already queued.
 
 ### HTTP Request / Response Logging
 
@@ -186,13 +261,41 @@ $logger->metrics($apiKey, 'revenue', [
 
 ## Error Handling
 
-All methods throw `PartnerApi\Logger\LoggerException` on failure:
+**Log calls never throw.** Delivery problems — a dead ingest, a rejected
+batch, a full buffer, a call with no API key — are handed to the `onError`
+callable. It defaults to a single `error_log()` of the message, which is the
+line 1.x wrote to stderr.
+
+```php
+use PartnerApi\Logger\Logger;
+use PartnerApi\Logger\LoggerErrorEvent;
+
+$logger = new Logger(
+    tenantToken: 'tenant_live_xxxxxxxxxxxx',
+    options: [
+        'onError' => function (LoggerErrorEvent $event): void {
+            // $event->reason: 'flush-failed' | 'buffer-overflow' | 'invalid-entry'
+            // $event->message is the exact string 1.x would have thrown
+            // ('Failed to send log: …', 'API key is required for logging')
+            // $event->entryCount / ->droppedTotal / ->status / ->attempts
+            // ->retryable / ->cause
+            error_log("[partner-logger] {$event->reason}: {$event->message}");
+        },
+    ],
+);
+```
+
+Anything thrown from the hook is swallowed — a broken error handler is not
+worth breaking the request over.
+
+`metric()` and `metrics()` are the exception: they still throw
+`PartnerApi\Logger\LoggerException` on validation or transport failure.
 
 ```php
 use PartnerApi\Logger\LoggerException;
 
 try {
-    $logger->info($apiKey, 'Hello');
+    $logger->metric($apiKey, ['slug' => 'revenue', /* … */]);
 } catch (LoggerException $e) {
     // Handle failure
 }

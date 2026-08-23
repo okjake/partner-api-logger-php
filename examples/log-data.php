@@ -133,7 +133,12 @@ if ($partnerId) {
 }
 echo "\n";
 
-$logger = new Logger($tenantToken, $baseUrl);
+// Direct mode on purpose. Since 2.0.0 the default is buffered — log calls
+// queue and drain after the response — which would make every step below
+// print OK and surface the real failures, if any, at the very end. This pump
+// exists to tell you per call whether ingest accepted it, so it opts into the
+// pre-2.0 synchronous profile. Application code should NOT do this.
+$logger = new Logger($tenantToken, $baseUrl, options: ['mode' => Logger::MODE_DIRECT]);
 
 if ($partnerId) {
     $logger->setContext(['partnerId' => $partnerId]);
