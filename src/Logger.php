@@ -271,9 +271,20 @@ class Logger
         $this->httpClient = $httpClient ?? new Client();
         $this->timestampProvider = $timestampProvider ?? fn () => (int) (microtime(true) * 1000);
 
-        $this->mode = ($options['mode'] ?? self::MODE_BUFFERED) === self::MODE_DIRECT
-            ? self::MODE_DIRECT
-            : self::MODE_BUFFERED;
+        // Same reasoning as the unknown-key check above, and the same blast
+        // radius: `PARTNER_API_LOG_MODE=diret` silently coercing to buffered
+        // would leave a consumer that asked for the 1.x profile quietly on the
+        // new one, catching nothing where it expects to catch.
+        $mode = $options['mode'] ?? self::MODE_BUFFERED;
+        if ($mode !== self::MODE_BUFFERED && $mode !== self::MODE_DIRECT) {
+            throw new LoggerException(sprintf(
+                'Unknown Logger mode: %s. Known modes: %s, %s',
+                is_scalar($mode) ? (string) $mode : get_debug_type($mode),
+                self::MODE_BUFFERED,
+                self::MODE_DIRECT,
+            ));
+        }
+        $this->mode = $mode;
 
         $this->onError = $options['onError'] ?? static function (LoggerErrorEvent $event): void {
             error_log($event->message);
@@ -928,15 +939,29 @@ class Logger
         }
         $this->shutdownArmed = true;
 
-        register_shutdown_function(function (): void {
-            // Hand the response to the client BEFORE talking to ingest, so
-            // delivery costs the partner's request nothing. Returns false if
-            // the framework already called it (Symfony/Laravel do) — harmless.
-            if ($this->finishRequestOnShutdown && function_exists('fastcgi_finish_request')) {
-                fastcgi_finish_request();
-            }
-            $this->flush();
-        });
+        register_shutdown_function($this->drainOnShutdown(...));
+    }
+
+    /** The end-of-request drain. Registered by {@see self::armShutdownFlush()}. */
+    private function drainOnShutdown(): void
+    {
+        // Hand the response to the client BEFORE talking to ingest, so
+        // delivery costs the partner's request nothing. Returns false if
+        // the framework already called it (Symfony/Laravel do) — harmless.
+        if ($this->finishRequestOnShutdown && function_exists('fastcgi_finish_request')) {
+            fastcgi_finish_request();
+        }
+
+        $this->flush();
+
+        // PHP runs shutdown functions in registration order, and this one is
+        // armed on the FIRST log call — so anything the application registered
+        // later runs after this drain. An entry logged from there (a
+        // fatal-error handler, a debug bar) would otherwise sit in the buffer
+        // until the process died, delivered by nothing and reported to no one.
+        // Disarming lets that entry arm a fresh hook: a function registered
+        // *during* shutdown still runs.
+        $this->shutdownArmed = false;
     }
 
     /**

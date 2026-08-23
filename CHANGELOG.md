@@ -48,8 +48,10 @@ response has been sent. See "What this costs your request" in the readme.
   A metrics call that used to take 8 s and succeed now raises
   `LoggerException`. `['requestTimeoutMs' => 0]` restores the old unbounded
   behaviour.
-- **An unknown constructor option raises.** A typo in `$options` would
-  otherwise silently leave a production default in place.
+- **An unknown constructor option — or an unknown `mode` — raises.** A typo in
+  `$options` would otherwise silently leave a production default in place, and
+  a typo'd `PARTNER_API_LOG_MODE` would silently leave a consumer that asked
+  for the 1.x profile on the new one, catching nothing where it expects to.
 
 ### Added
 

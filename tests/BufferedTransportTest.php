@@ -811,6 +811,64 @@ class BufferedTransportTest extends TestCase
         new Logger(tenantToken: 'tenant', options: ['maxRetryes' => 1]);
     }
 
+    public function testAnUnknownModeIsRejected(): void
+    {
+        // Silently coercing to buffered would leave a consumer that asked for
+        // the 1.x profile quietly on the new one, catching nothing where it
+        // expects to catch. `PARTNER_API_LOG_MODE` makes this a typo away.
+        $this->expectException(LoggerException::class);
+        $this->expectExceptionMessage('Unknown Logger mode: diret. Known modes: buffered, direct');
+
+        new Logger(tenantToken: 'tenant', options: ['mode' => 'diret']);
+    }
+
+    /**
+     * The one test that lets the logger arm real shutdown functions. Safe
+     * because it leaves the buffer empty: when PHP calls them for real at the
+     * end of the PHPUnit process, `flush()` finds nothing and returns without
+     * touching the mock transport.
+     */
+    public function testTheShutdownDrainRearmsAfterItHasRun(): void
+    {
+        $logger = $this->logger(['flushOnShutdown' => true]);
+
+        $logger->info(self::KEY, 'a');
+        $this->assertTrue($this->armedFlagOf($logger));
+
+        // Stands in for PHP calling the registered hook at end of request.
+        $this->runShutdownDrain($logger);
+
+        $this->assertCount(1, $this->captured);
+        $this->assertFalse(
+            $this->armedFlagOf($logger),
+            'the hook disarms itself so a later entry can arm a fresh one',
+        );
+
+        // An application shutdown function registered after the logger's — a
+        // fatal-error handler, a debug bar — logging during shutdown. PHP runs
+        // those after this one, and a function registered during shutdown
+        // still runs, so the entry must not be stranded.
+        $logger->info(self::KEY, 'b');
+
+        $this->assertTrue($this->armedFlagOf($logger), 'a fresh hook is armed for it');
+        $this->assertSame(1, $logger->stats()['buffered']);
+
+        $this->runShutdownDrain($logger);
+
+        $this->assertCount(2, $this->captured, 'the late entry is delivered, not silently lost');
+        $this->assertSame(0, $logger->stats()['buffered']);
+    }
+
+    private function armedFlagOf(Logger $logger): bool
+    {
+        return (new \ReflectionProperty(Logger::class, 'shutdownArmed'))->getValue($logger);
+    }
+
+    private function runShutdownDrain(Logger $logger): void
+    {
+        (new \ReflectionMethod(Logger::class, 'drainOnShutdown'))->invoke($logger);
+    }
+
     // ------------------------------------------------------------------- helpers
 
     /**

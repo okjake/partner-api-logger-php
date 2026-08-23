@@ -71,7 +71,15 @@ chunk, retry and backoff, with each individual attempt clamped to whatever is
 left of the budget. Entries still undelivered when it runs out are reported to
 `onError` with reason `drain-timeout` and dropped.
 
-> **PHP-FPM:** the end-of-request drain runs inside the same FPM request as the
+> **PHP-FPM, `fastcgi_finish_request()`:** the shutdown drain calls
+> `fastcgi_finish_request()` before it posts, so the client has its response
+> first. Under Laravel or any Symfony-based stack that is a no-op — the
+> framework already called it — but on a bare FPM app it means this SDK ends
+> the response, and any shutdown function your application registered *after*
+> its first log call will no longer be able to write output. Pass
+> `finishRequestOnShutdown => false` if your app needs to own that moment.
+
+> **PHP-FPM, `request_terminate_timeout`:** the end-of-request drain runs inside the same FPM request as the
 > response it already sent, so it counts against `request_terminate_timeout`.
 > Keep `drainDeadlineMs` comfortably under that value (the default 5 s sits
 > well inside a typical 30 s) or FPM will kill the worker mid-drain and the
