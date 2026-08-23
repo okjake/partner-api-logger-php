@@ -30,12 +30,17 @@ use Ramsey\Uuid\Uuid;
  * workers (Octane, queues) where per-request shutdown functions never fire.
  *
  * **What a caller can be made to wait for.** Only (2) runs inside a log call,
- * and it is deliberately cheap: one attempt, bounded by `autoDrainTimeoutMs`
- * (default 1000 ms), no backoff sleep, and a chunk that failed for a
- * retryable reason goes back on the buffer rather than being retried on the
- * request path. A failed auto-drain then latches off for the rest of the
- * request, so N log calls cannot cost N timeouts. So a single log call blocks
- * for at most `autoDrainTimeoutMs`, and a whole request for at most that once.
+ * and it is deliberately cheap: one attempt per batch, the drain *as a whole*
+ * bounded by `autoDrainTimeoutMs` (default 1000 ms), no backoff sleep, and any
+ * chunk it could not deliver — refused for a retryable reason, or never
+ * reached before the budget ran out — goes back on the buffer rather than
+ * being retried on the request path. A failed auto-drain then latches off for
+ * the rest of the request, so N log calls cannot cost N timeouts. So a single
+ * log call blocks for at most `autoDrainTimeoutMs`, and a whole request for at
+ * most that once. The budget has to cover the whole drain and not just one
+ * attempt: a drain posts one request per (apiKey, labels, upstream) group, so
+ * a per-attempt bound would still let a request that logged at four levels
+ * pay four timeouts inside a single `info()`.
  *
  * (1) and (3) carry the retries, and are bounded as a whole by
  * `drainDeadlineMs` (default 5000 ms). That matters most for (3): it runs
@@ -225,10 +230,11 @@ class Logger
      * - `requestTimeoutMs` — per-request deadline (default 5000; `0` disables).
      *   Guzzle has no timeout by default, so without this a blackholed ingest
      *   hangs the flush — and in direct mode, the request itself.
-     * - `autoDrainTimeoutMs` — the per-request deadline for the `batchSize`
-     *   drain, which is the only drain a caller waits on (default 1000). This
-     *   is the SDK's whole budget for one log call: one attempt, no backoff
-     *   sleep, and a still-retryable chunk goes back on the buffer for the
+     * - `autoDrainTimeoutMs` — total wall-clock budget for the `batchSize`
+     *   drain, which is the only drain a caller waits on (default 1000; `0`
+     *   disables the bound). This is the SDK's whole budget for one log call,
+     *   across every group and chunk: one attempt each, no backoff sleep, and
+     *   anything it could not deliver in time goes back on the buffer for the
      *   end-of-request drain rather than being retried on the request path.
      * - `drainDeadlineMs` — total wall-clock budget for one `flush()` /
      *   `shutdown()` / end-of-request drain, across every group, chunk, retry
@@ -462,11 +468,13 @@ class Logger
         $this->buffer = [];
         $this->draining = true;
 
-        // `0` disables the bound; an AUTO drain is bounded by its own
-        // single-attempt timeout instead, so it needs no wall-clock budget.
-        $deadline = ($profile === self::DRAIN_FULL && $this->drainDeadlineMs > 0)
-            ? $this->clockMs() + $this->drainDeadlineMs
-            : null;
+        // Both profiles get a wall-clock budget, because both can hold a
+        // caller. A per-attempt timeout is not a bound on the drain: one drain
+        // posts one chunk per (apiKey, labels, upstream) group, so bounding
+        // only the attempt leaves the log call costing groups × the timeout —
+        // 4 s for a request that logged at four levels. `0` disables.
+        $budget = $profile === self::DRAIN_AUTO ? $this->autoDrainTimeoutMs : $this->drainDeadlineMs;
+        $deadline = $budget > 0 ? $this->clockMs() + $budget : null;
 
         try {
             $pending = [];
@@ -484,7 +492,22 @@ class Logger
 
                 if ($deadline !== null && $this->clockMs() >= $deadline) {
                     array_unshift($pending, $chunk);
-                    $this->abandon($pending);
+
+                    if ($profile === self::DRAIN_AUTO) {
+                        // Never attempted, and the caller's budget is spent.
+                        // Back on the buffer for the end-of-request drain —
+                        // dropping here would lose entries to a budget that
+                        // exists only to protect the request, not to ration
+                        // delivery.
+                        foreach ($pending as $unsent) {
+                            foreach ($unsent as $queued) {
+                                $requeue[] = $queued;
+                            }
+                        }
+                    } else {
+                        $this->abandon($pending);
+                    }
+
                     $delivered = false;
                     break;
                 }
@@ -1077,23 +1100,25 @@ class Logger
      */
     private function timeoutFor(string $profile, ?float $deadline): int
     {
-        if ($profile === self::DRAIN_AUTO) {
-            return $this->autoDrainTimeoutMs;
-        }
+        // An AUTO drain's own budget is the ceiling for the whole drain, so a
+        // single attempt can never be allowed more than what is left of it.
+        $ceiling = $profile === self::DRAIN_AUTO
+            ? $this->autoDrainTimeoutMs
+            : $this->requestTimeoutMs;
 
         if ($deadline === null) {
-            return $this->requestTimeoutMs;
+            return $ceiling;
         }
 
         $remaining = (int) max(0, $deadline - $this->clockMs());
 
         // `requestTimeoutMs: 0` disables the per-request deadline, but the
         // drain budget still bounds the attempt.
-        if ($this->requestTimeoutMs <= 0) {
+        if ($ceiling <= 0) {
             return max(1, $remaining);
         }
 
-        return max(1, min($this->requestTimeoutMs, $remaining));
+        return max(1, min($ceiling, $remaining));
     }
 
     /**

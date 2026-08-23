@@ -516,6 +516,62 @@ class BufferedTransportTest extends TestCase
         );
     }
 
+    public function testTheAutoDrainBudgetCoversTheWholeDrainNotOneAttempt(): void
+    {
+        // A drain posts one request per (apiKey, labels, upstream) group, so a
+        // budget spent per *attempt* is not a bound on the log call at all: a
+        // request that logged at four levels used to pay 4 × autoDrainTimeoutMs
+        // inside a single info(), against a documented bound of 1 × 1000 ms.
+        $logger = $this->logger(
+            ['batchSize' => 4, 'autoDrainTimeoutMs' => 1000],
+            [$this->blackhole(), $this->blackhole(), $this->blackhole(), $this->blackhole()],
+        );
+
+        $logger->info(self::KEY, 'a');
+        $logger->warn(self::KEY, 'b');
+        $logger->error(self::KEY, 'c');
+        $logger->debug(self::KEY, 'd');
+
+        $this->assertSame(1000.0, $this->now, 'four groups still cost one autoDrainTimeoutMs');
+        $this->assertCount(1, $this->captured, 'the budget was spent on the first group');
+        $this->assertSame(4, $logger->stats()['buffered'], 'the groups it never reached are kept');
+        $this->assertSame(0, $logger->stats()['dropped'], 'a request-path budget rations time, not delivery');
+        $this->assertSame([], $this->reported);
+    }
+
+    public function testEachAutoDrainAttemptIsClampedToWhatIsLeftOfTheBudget(): void
+    {
+        $logger = $this->logger(
+            ['batchSize' => 2, 'autoDrainTimeoutMs' => 1000, 'requestTimeoutMs' => 5000],
+            [
+                // Burns 600 ms of the 1000 ms budget, leaving 400 ms.
+                function (array $options) {
+                    $this->now += 600.0;
+
+                    throw new ConnectException(
+                        'cURL error 28: Operation timed out',
+                        new Request('POST', 'https://ingest.test/logs'),
+                    );
+                },
+                $this->blackhole(),
+            ],
+        );
+
+        $logger->info(self::KEY, 'a');
+        $logger->error(self::KEY, 'b');
+
+        $this->assertCount(2, $this->captured);
+        $this->assertEqualsWithDelta(1.0, $this->captured[0]['options']['timeout'], 0.001);
+        $this->assertEqualsWithDelta(
+            0.4,
+            $this->captured[1]['options']['timeout'],
+            0.001,
+            'the second group may only have what the first left',
+        );
+        $this->assertSame(1000.0, $this->now);
+        $this->assertSame(2, $logger->stats()['buffered']);
+    }
+
     public function testAFailedAutoDrainRebuffersInsteadOfDropping(): void
     {
         $logger = $this->logger(
