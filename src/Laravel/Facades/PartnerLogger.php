@@ -15,6 +15,10 @@ use PartnerApi\Logger\Logger;
  * @method static void logResponse(string $apiKey, array $response)
  * @method static void metric(string $apiKey, array $data)
  * @method static void metrics(string $apiKey, string $slug, array $points)
+ * @method static void flush()
+ * @method static void shutdown()
+ * @method static void close()
+ * @method static array{buffered: int, delivered: int, dropped: int} stats()
  *
  * @see \PartnerApi\Logger\Logger
  */
