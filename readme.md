@@ -50,14 +50,14 @@ Need the 1.x behaviour — a POST per call, an exception on failure? Pass
 ## What this costs your request
 
 Delivery is synchronous — PHP has no event loop to hand it to — so "buffered"
-has to mean *bounded*, not *free*. Two budgets do that, and nothing else in the
+has to mean _bounded_, not _free_. Two budgets do that, and nothing else in the
 SDK blocks:
 
-| | Runs | Worst case |
-| --- | --- | --- |
-| **A single log call** | drain 2, only once `batchSize` is reached | `autoDrainTimeoutMs` — **1 s** by default |
-| **Whole request, log calls only** | — | `autoDrainTimeoutMs`, once |
-| **End-of-request drain** | drains 1 and 3, after the response is sent | `drainDeadlineMs` — **5 s** by default |
+|                                   | Runs                                       | Worst case                                |
+| --------------------------------- | ------------------------------------------ | ----------------------------------------- |
+| **A single log call**             | drain 2, only once `batchSize` is reached  | `autoDrainTimeoutMs` — **1 s** by default |
+| **Whole request, log calls only** | —                                          | `autoDrainTimeoutMs`, once                |
+| **End-of-request drain**          | drains 1 and 3, after the response is sent | `drainDeadlineMs` — **5 s** by default    |
 
 The request-path drain is deliberately cheap: **one** attempt on a short
 deadline, **no** backoff sleep, and a chunk that failed for a retryable reason
@@ -66,7 +66,7 @@ fails it latches off for the rest of the request, so N log calls can never cost
 N timeouts.
 
 The retries live in the end-of-request drain, where they cost your caller
-nothing, and `drainDeadlineMs` bounds that drain *as a whole* — every group,
+nothing, and `drainDeadlineMs` bounds that drain _as a whole_ — every group,
 chunk, retry and backoff, with each individual attempt clamped to whatever is
 left of the budget. Entries still undelivered when it runs out are reported to
 `onError` with reason `drain-timeout` and dropped.
@@ -75,7 +75,7 @@ left of the budget. Entries still undelivered when it runs out are reported to
 > `fastcgi_finish_request()` before it posts, so the client has its response
 > first. Under Laravel or any Symfony-based stack that is a no-op — the
 > framework already called it — but on a bare FPM app it means this SDK ends
-> the response, and any shutdown function your application registered *after*
+> the response, and any shutdown function your application registered _after_
 > its first log call will no longer be able to write output. Pass
 > `finishRequestOnShutdown => false` if your app needs to own that moment.
 
@@ -83,7 +83,7 @@ left of the budget. Entries still undelivered when it runs out are reported to
 > response it already sent, so it counts against `request_terminate_timeout`.
 > Keep `drainDeadlineMs` comfortably under that value (the default 5 s sits
 > well inside a typical 30 s) or FPM will kill the worker mid-drain and the
-> buffer dies with it. Note that `max_execution_time` will *not* save you here:
+> buffer dies with it. Note that `max_execution_time` will _not_ save you here:
 > on Unix its timer does not tick during a blocking socket wait.
 
 Set `drainDeadlineMs => 0` to opt out of the bound entirely, and
@@ -105,10 +105,27 @@ PARTNER_API_TENANT_TOKEN=tenant_live_xxxxxxxxxxxx
 PARTNER_API_BASE_URL=https://ingest.partnerapi.com
 ```
 
+### Where the two credentials come from
+
+They are not the same kind of thing, and only one of them is yours:
+
+- **`tenantToken`** is a single secret for your whole tenant. Every partner's
+  traffic travels on it, so it lives in your environment
+  (`PARTNER_API_TENANT_TOKEN`) and is set once, when the `Logger` is
+  constructed — under Laravel, by the config file above.
+- **`$apiKey`** — the first argument to every log and metric call — is **not**
+  looked up. Each partner app sends its own key on the request it makes to
+  _your_ API, in the `x-api-key` header. Read that value off the incoming
+  request and pass it straight through. That is what tells one partner's
+  traffic from another's; hardcode a single key and every partner's logs arrive
+  labelled as the same app.
+
 ### Using the Facade
 
 ```php
 use PartnerApi\Logger\Laravel\Facades\PartnerLogger;
+
+$apiKey = $request->header('x-api-key'); // sent by the partner app
 
 PartnerLogger::info($apiKey, 'Order created', ['orderId' => $order->id]);
 ```
@@ -122,6 +139,7 @@ class OrderController extends Controller
 {
     public function store(Request $request, Logger $logger)
     {
+        $apiKey = $request->header('x-api-key'); // sent by the partner app
         // ...
         $logger->info($apiKey, 'Order created', ['orderId' => $order->id]);
     }
