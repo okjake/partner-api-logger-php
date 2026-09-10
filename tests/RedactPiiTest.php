@@ -82,11 +82,18 @@ class RedactPiiTest extends TestCase
             ['_sessionId', '[SESSION_REDACTED]'],
             ['token_', '[TOKEN_REDACTED]'],
             ['SESSIONID', '[SESSION_REDACTED]'],
-            ['cvc', '[CARD_REDACTED]'],
+            ['cvc', '[SENSITIVE_DATA_REDACTED]'],
             ['access_tokens', '[TOKEN_REDACTED]'],
             ['userSessions', '[SESSION_REDACTED]'],
             ['serverCerts', '[SENSITIVE_DATA_REDACTED]'],
             ['userPins', '[SENSITIVE_DATA_REDACTED]'],
+            // Canonical JavaScript lowercase introduces ASCII from these folds.
+            ['apiKey', '[KEY_REDACTED]'],
+            ['apiKeyId', '[KEY_REDACTED]'],
+            ['cooKie', '[COOKIE_REDACTED]'],
+            ['APİ_KEY', '[KEY_REDACTED]'],
+            ['apİKeys', '[KEY_REDACTED]'],
+            ['cooKies', '[COOKIE_REDACTED]'],
         ];
     }
 
@@ -123,6 +130,13 @@ class RedactPiiTest extends TestCase
             ['secretsauce'],
             ['cookieValue'],
             ['tokensCount'],
+            // Fold after case boundaries; do not add compatibility normalization.
+            ['fooKPassword'],
+            ['fooKToken'],
+            ['apiＫey'],
+            ['ſecret'],
+            ['APİ_X_KEY'],
+            ['sessionKey'],
         ];
     }
 

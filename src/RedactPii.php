@@ -172,7 +172,17 @@ final class RedactPii
         $key = preg_replace('/([a-z0-9])([A-Z])/', '$1_$2', $key) ?? $key;
         // Fixed-width lookahead keeps long acronym runs linear in PCRE too.
         $key = preg_replace('/([A-Z])(?=[A-Z][a-z])/', '$1_', $key) ?? $key;
-        return preg_split('/[^a-z0-9]+/', strtolower($key), -1, PREG_SPLIT_NO_EMPTY) ?: [];
+        return preg_split('/[^a-z0-9]+/', self::lowercaseKeyForAsciiMatching($key), -1, PREG_SPLIT_NO_EMPTY) ?: [];
+    }
+
+    private static function lowercaseKeyForAsciiMatching(string $key): string
+    {
+        // Canonical Node 22 / Unicode 16 lowercase introduces ASCII from only
+        // these two non-ASCII scalars. Other non-ASCII characters stay separators.
+        // Fold AFTER case-boundary splitting, without compatibility normalization.
+        $key = strtr($key, ["\u{0130}" => "i\u{0307}", "\u{212A}" => 'k']);
+        // Explicit ASCII mapping also stays locale-independent on PHP 8.1.
+        return strtr($key, 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz');
     }
 
     /** @param list<string> $terms */
@@ -210,14 +220,14 @@ final class RedactPii
 
     private static function getRedactedValueForKey(string $key): string
     {
-        $lower = strtolower($key);
+        $lower = self::lowercaseKeyForAsciiMatching($key);
         if (str_contains($lower, 'email')) return '[EMAIL_REDACTED]';
         if (str_contains($lower, 'password') || str_contains($lower, 'pwd')) return '[PASSWORD_REDACTED]';
         if (str_contains($lower, 'token')) return '[TOKEN_REDACTED]';
         if (str_contains($lower, 'key')) return '[KEY_REDACTED]';
         if (str_contains($lower, 'secret')) return '[SECRET_REDACTED]';
         if (str_contains($lower, 'phone')) return '[PHONE_REDACTED]';
-        if (str_contains($lower, 'card') || str_contains($lower, 'cvv') || str_contains($lower, 'cvc')) return '[CARD_REDACTED]';
+        if (str_contains($lower, 'card') || str_contains($lower, 'cvv')) return '[CARD_REDACTED]';
         if (str_contains($lower, 'session')) return '[SESSION_REDACTED]';
         if (str_contains($lower, 'cookie')) return '[COOKIE_REDACTED]';
         return '[SENSITIVE_DATA_REDACTED]';
