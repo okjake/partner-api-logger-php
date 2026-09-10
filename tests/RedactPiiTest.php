@@ -12,9 +12,172 @@ namespace PartnerApi\Logger\Tests;
 use PartnerApi\Logger\RedactPii;
 use function PartnerApi\Logger\redactPII;
 use PHPUnit\Framework\TestCase;
+use PHPUnit\Framework\Attributes\DataProvider;
 
 class RedactPiiTest extends TestCase
 {
+    /**
+     * PAPI-4367 unit helper contract: mirror the canonical database matcher's
+     * whole segments, prefix-tolerant runs, head nouns and exact +s plurals.
+     * Exercise the public API with inert values so value regexes cannot hide
+     * a missing key rule. Both redaction and readable operational names matter.
+     */
+    #[DataProvider('sensitiveFieldNames')]
+    public function testCanonicalSensitiveFieldNames(string $key, string $marker): void
+    {
+        $this->assertSame([$key => $marker], RedactPii::redact([$key => 'qfprobevalue']));
+    }
+
+    public static function sensitiveFieldNames(): array
+    {
+        return [
+            ['clientSecret', '[SECRET_REDACTED]'],
+            ['sessionKey', '[KEY_REDACTED]'],
+            ['session_key', '[KEY_REDACTED]'],
+            ['userPassword', '[PASSWORD_REDACTED]'],
+            ['refreshToken', '[TOKEN_REDACTED]'],
+            ['privateKey', '[KEY_REDACTED]'],
+            ['xApiKey', '[KEY_REDACTED]'],
+            ['accessToken', '[TOKEN_REDACTED]'],
+            ['secrets', '[SECRET_REDACTED]'],
+            ['passwords', '[PASSWORD_REDACTED]'],
+            ['apikeys', '[KEY_REDACTED]'],
+            ['tokens', '[TOKEN_REDACTED]'],
+            ['cookies', '[COOKIE_REDACTED]'],
+            ['socialSecurity', '[SENSITIVE_DATA_REDACTED]'],
+            ['creditCardNumber', '[CARD_REDACTED]'],
+            ['sessionId', '[SESSION_REDACTED]'],
+            ['session_id', '[SESSION_REDACTED]'],
+            ['api_key', '[KEY_REDACTED]'],
+            ['apikey', '[KEY_REDACTED]'],
+            ['user_token', '[TOKEN_REDACTED]'],
+            ['password', '[PASSWORD_REDACTED]'],
+            ['secret', '[SECRET_REDACTED]'],
+            ['x-api-key', '[KEY_REDACTED]'],
+            ['x-auth-token', '[TOKEN_REDACTED]'],
+            ['cvv', '[CARD_REDACTED]'],
+            ['cookie', '[COOKIE_REDACTED]'],
+            ['secretKey', '[KEY_REDACTED]'],
+            ['passwordHash', '[PASSWORD_REDACTED]'],
+            ['api_key_id', '[KEY_REDACTED]'],
+            ['api_keys', '[KEY_REDACTED]'],
+            ['accessTokens', '[TOKEN_REDACTED]'],
+            ['session_ids', '[SESSION_REDACTED]'],
+            ['creditCards', '[CARD_REDACTED]'],
+            ['private_keys', '[KEY_REDACTED]'],
+            ['credit_cardholder', '[CARD_REDACTED]'],
+            ['userPin', '[SENSITIVE_DATA_REDACTED]'],
+            ['serverCert', '[SENSITIVE_DATA_REDACTED]'],
+            ['tlsCertificate', '[SENSITIVE_DATA_REDACTED]'],
+            ['passwd', '[SENSITIVE_DATA_REDACTED]'],
+            ['oauthPwd', '[PASSWORD_REDACTED]'],
+            ['authBearer', '[SENSITIVE_DATA_REDACTED]'],
+            ['userSsn', '[SENSITIVE_DATA_REDACTED]'],
+            ['cardCvc', '[CARD_REDACTED]'],
+            ['publickey', '[KEY_REDACTED]'],
+            ['APIKeyId', '[KEY_REDACTED]'],
+            ['HTTPCookie', '[COOKIE_REDACTED]'],
+            ['session.id', '[SESSION_REDACTED]'],
+            ['auth.clientSecret', '[SECRET_REDACTED]'],
+            ['_sessionId', '[SESSION_REDACTED]'],
+            ['token_', '[TOKEN_REDACTED]'],
+            ['SESSIONID', '[SESSION_REDACTED]'],
+            ['cvc', '[CARD_REDACTED]'],
+            ['access_tokens', '[TOKEN_REDACTED]'],
+            ['userSessions', '[SESSION_REDACTED]'],
+            ['serverCerts', '[SENSITIVE_DATA_REDACTED]'],
+            ['userPins', '[SENSITIVE_DATA_REDACTED]'],
+        ];
+    }
+
+    #[DataProvider('readableFieldNames')]
+    public function testCanonicalReadableFieldNames(string $key): void
+    {
+        $this->assertSame([$key => 'qfprobevalue'], RedactPii::redact([$key => 'qfprobevalue']));
+    }
+
+    public static function readableFieldNames(): array
+    {
+        return [
+            ['sessionDuration'],
+            ['tokenCount'],
+            ['tokenExpiresAt'],
+            ['sessionStartedAt'],
+            ['keyboardLayout'],
+            ['pinned'],
+            ['certainty'],
+            ['secretary'],
+            ['cacheKey'],
+            ['sortKey'],
+            ['partitionKey'],
+            ['idempotencyKey'],
+            ['reservationId'],
+            ['cardId'],
+            ['bookingReference'],
+            ['certExpiryDays'],
+            ['pinPosition'],
+            ['session.duration'],
+            [''],
+            ['___'],
+            ['xapi_key'],
+            ['secretsauce'],
+            ['cookieValue'],
+            ['tokensCount'],
+        ];
+    }
+
+    public function testEquivalentSpellingConventions(): void
+    {
+        foreach ([
+            ['clientSecret', 'client_secret', 'client-secret'],
+            ['sessionKey', 'session_key', 'session-key'],
+            ['userPassword', 'user_password', 'user-password'],
+            ['sessionDuration', 'session_duration', 'session-duration'],
+        ] as [$camel, $snake, $kebab]) {
+            $expected = RedactPii::redact([$camel => 'qfprobevalue'])[$camel];
+            $this->assertSame($expected, RedactPii::redact([$snake => 'qfprobevalue'])[$snake]);
+            $this->assertSame($expected, RedactPii::redact([$kebab => 'qfprobevalue'])[$kebab]);
+        }
+    }
+
+    public function testNestedKeyPolicySurvivesStringOptionsAndDropMode(): void
+    {
+        $input = ['auth' => [
+            'clientSecret' => ['nested' => 'qfprobevalue'],
+            'sessionKey' => null,
+            'passwordHash' => false,
+            'tokenCount' => 7,
+            'notes' => 'a@example.com',
+        ]];
+        $options = ['redactEmails' => false, 'redactTokens' => false,
+            'redactPasswords' => false, 'redactApiKeys' => false];
+        $this->assertSame(['auth' => [
+            'clientSecret' => '[SECRET_REDACTED]',
+            'sessionKey' => '[KEY_REDACTED]',
+            'passwordHash' => '[PASSWORD_REDACTED]',
+            'tokenCount' => 7,
+            'notes' => 'a@example.com',
+        ]], redactPII($input, $options));
+        $this->assertSame(['auth' => ['tokenCount' => 7, 'notes' => 'a@example.com']],
+            RedactPii::redact($input, array_merge($options, ['preserveStructure' => false])));
+        $this->assertSame(['nested' => 'qfprobevalue'], $input['auth']['clientSecret']);
+        $this->assertNull($input['auth']['sessionKey']);
+    }
+
+    public function testLongAcronymBoundaryDoesNotExhaustPcreBacktracking(): void
+    {
+        // Fixed-width lookahead scans this adversarial key once. The old
+        // tempting ([A-Z]+)([A-Z][a-z]) split exhausts this small budget.
+        $previous = ini_set('pcre.backtrack_limit', '10000');
+        try {
+            $key = str_repeat('A', 50000) . '_HTTPCookie';
+            $this->assertSame('[COOKIE_REDACTED]', RedactPii::redact([$key => 'qfprobevalue'])[$key]);
+            $this->assertSame(PREG_NO_ERROR, preg_last_error());
+        } finally {
+            ini_set('pcre.backtrack_limit', $previous);
+        }
+    }
+
     public function testProceduralAliasReachableFromPackageNamespace(): void
     {
         $this->assertSame(

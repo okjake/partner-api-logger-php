@@ -21,41 +21,47 @@ namespace PartnerApi\Logger;
  */
 final class RedactPii
 {
-    /**
-     * @var array<string>
-     */
-    private const SENSITIVE_KEYS = [
+    /** Whole segments (or exact +s plurals), at any position. */
+    private const SENSITIVE_SEGMENTS = [
         'password',
         'passwd',
         'pwd',
         'secret',
-        'token',
         'apikey',
-        'api_key',
         'accesstoken',
-        'access_token',
         'refreshtoken',
-        'refresh_token',
         'privatekey',
-        'private_key',
         'publickey',
-        'public_key',
         'certificate',
-        'cert',
         'ssn',
-        'social_security',
-        'credit_card',
         'creditcard',
         'cvv',
         'cvc',
-        'pin',
         'bearer',
-        'session',
         'sessionid',
-        'session_id',
+    ];
+
+    /** Contiguous runs; only the final word is prefix-tolerant. */
+    private const SENSITIVE_SEGMENT_RUNS = [
+        ['api', 'key'],
+        ['access', 'token'],
+        ['refresh', 'token'],
+        ['private', 'key'],
+        ['public', 'key'],
+        ['session', 'key'],
+        ['session', 'id'],
+        ['social', 'security'],
+        ['credit', 'card'],
+        ['x', 'auth', 'token'],
+    ];
+
+    /** Ambiguous terms (or exact +s plurals), only as the last segment. */
+    private const SENSITIVE_HEAD_NOUNS = [
+        'token',
+        'session',
         'cookie',
-        'x-api-key',
-        'x-auth-token',
+        'cert',
+        'pin',
     ];
 
     /**
@@ -133,21 +139,70 @@ final class RedactPii
         return $result;
     }
 
+    /**
+     * Canonical policy: packages/database/src/pii-sanitizer.ts (PAPI-4367).
+     * Match whole segments, prefix-tolerant multi-word runs, or head nouns.
+     * Single terms also match an exact trailing s, never an arbitrary prefix.
+     */
     private static function isSensitiveKey(string $key): bool
     {
-        $lower = strtolower($key);
-        foreach (self::SENSITIVE_KEYS as $sensitive) {
-            if (str_contains($sensitive, '_') || str_contains($sensitive, '-')) {
-                if (str_contains($lower, $sensitive)) {
-                    return true;
-                }
-            } else {
-                if ($lower === $sensitive
-                    || str_ends_with($lower, '_' . $sensitive)
-                    || str_ends_with($lower, '-' . $sensitive)
+        $segments = self::toKeySegments($key);
+        if ($segments === []) {
+            return false;
+        }
+        if (self::namesTerm($segments[count($segments) - 1], self::SENSITIVE_HEAD_NOUNS)) {
+            return true;
+        }
+        foreach ($segments as $segment) {
+            if (self::namesTerm($segment, self::SENSITIVE_SEGMENTS)) {
+                return true;
+            }
+        }
+        foreach (self::SENSITIVE_SEGMENT_RUNS as $run) {
+            if (self::hasSegmentRun($segments, $run)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** @return list<string> */
+    private static function toKeySegments(string $key): array
+    {
+        $key = preg_replace('/([a-z0-9])([A-Z])/', '$1_$2', $key) ?? $key;
+        // Fixed-width lookahead keeps long acronym runs linear in PCRE too.
+        $key = preg_replace('/([A-Z])(?=[A-Z][a-z])/', '$1_', $key) ?? $key;
+        return preg_split('/[^a-z0-9]+/', strtolower($key), -1, PREG_SPLIT_NO_EMPTY) ?: [];
+    }
+
+    /** @param list<string> $terms */
+    private static function namesTerm(string $segment, array $terms): bool
+    {
+        return in_array($segment, $terms, true)
+            || (str_ends_with($segment, 's') && in_array(substr($segment, 0, -1), $terms, true));
+    }
+
+    /**
+     * @param list<string> $segments
+     * @param list<string> $run
+     */
+    private static function hasSegmentRun(array $segments, array $run): bool
+    {
+        $lastOffset = count($run) - 1;
+        $segmentCount = count($segments);
+        for ($start = 0; $start + $lastOffset < $segmentCount; $start++) {
+            $matched = true;
+            foreach ($run as $offset => $term) {
+                if ($offset === $lastOffset
+                    ? !str_starts_with($segments[$start + $offset], $term)
+                    : $segments[$start + $offset] !== $term
                 ) {
-                    return true;
+                    $matched = false;
+                    break;
                 }
+            }
+            if ($matched) {
+                return true;
             }
         }
         return false;
@@ -162,7 +217,7 @@ final class RedactPii
         if (str_contains($lower, 'key')) return '[KEY_REDACTED]';
         if (str_contains($lower, 'secret')) return '[SECRET_REDACTED]';
         if (str_contains($lower, 'phone')) return '[PHONE_REDACTED]';
-        if (str_contains($lower, 'card') || str_contains($lower, 'cvv')) return '[CARD_REDACTED]';
+        if (str_contains($lower, 'card') || str_contains($lower, 'cvv') || str_contains($lower, 'cvc')) return '[CARD_REDACTED]';
         if (str_contains($lower, 'session')) return '[SESSION_REDACTED]';
         if (str_contains($lower, 'cookie')) return '[COOKIE_REDACTED]';
         return '[SENSITIVE_DATA_REDACTED]';
