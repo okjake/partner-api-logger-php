@@ -249,6 +249,18 @@ $logger->logResponse($apiKey, [
 
 Sensitive headers (`Authorization`, `Cookie`, `X-API-Key`, etc.) are automatically redacted.
 
+**Log bodies to get entity views.** Entity View rebuilds each entity's history
+from the `body` you pass to `logRequest()` and `logResponse()`. If you log no
+body, there is no entity view. Pass the decoded array (`$request->json()->all()`
+for a JSON API). `$request->all()`, used above, also merges in query-string
+parameters. A body passed as a string (form-encoded, text or a JSON string) is
+stored as a string, and only a JSON object contributes fields. PHP encodes an
+empty array as `[]`, a list, so an empty body contributes nothing. Ingest
+redacts personal data and credentials in bodies before storing them, and it
+replaces any log line larger than 250 KB with a marker that carries no body.
+The full list of limits is in `docs/features/entity-view.md` § Projection
+fidelity limits.
+
 ## PII Redaction Helper
 
 For call sites that need to redact PII before passing user data into a downstream system whose logs you don't control, the package exposes a public `redactPII()` helper. The ruleset mirrors what the ingest service applies internally — emails, JWTs, Bearer tokens, named API-key prefixes, passwords, phone numbers, credit cards, IPv4/IPv6 addresses, and URL query strings.
