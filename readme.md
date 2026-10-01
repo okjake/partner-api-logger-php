@@ -7,6 +7,10 @@ Send structured logs and metrics to the Partner API ingest service.
 ## Requirements
 
 - PHP 8.1+
+- No PHP extension beyond the ones every PHP 8.1 build has (json, pcre). In
+  particular ext-bcmath is not needed, so the official `php:*-cli` images
+  work as they are. HTTP goes through Guzzle, which uses ext-curl when it is
+  installed and PHP streams (`allow_url_fopen`) otherwise.
 
 ## Installation
 

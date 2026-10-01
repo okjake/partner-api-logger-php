@@ -217,7 +217,7 @@ class Logger
     private int $rootResponses = 0;
     private bool $reportedRootUpstream = false;
 
-    /** @var callable(): int */
+    /** @var callable(): (int|float|string) Epoch ms; see nanosecondTimestamp(). */
     private $timestampProvider;
 
     /** @var callable(LoggerErrorEvent): void */
@@ -1451,13 +1451,63 @@ class Logger
     }
 
     /**
+     * Epoch milliseconds → the decimal nanosecond string ingest expects, or
+     * null for a value that is not a timestamp.
+     *
+     * Up to 2.0.0 this was bcmath's multiply of `(string) $ms` by 1000000 at
+     * scale 0. That needs ext-bcmath — never declared, and absent from the
+     * official php images — so there every entry failed (FLT-1306). This
+     * reproduces the same bytes without it: a multiply by 10^6 is a six-place
+     * decimal shift, truncated toward zero as scale 0 truncates.
+     *
+     * - int: append six zeros. Exact even at PHP_INT_MAX, where a multiply
+     *   would overflow to a float.
+     * - float: the same `(string)` cast bcmath was handed, so it keeps what
+     *   that cast keeps under the `precision` ini (one sub-ms digit at the
+     *   default 14). NAN/INF, and the exponent form the cast produces from
+     *   10^precision up (1e14 at the default 14) and for tiny values, are
+     *   rejected — bcmath rejected them too.
+     * - string, or a Stringable such as a Brick\Math number (cast first, as
+     *   bcmath's string parameter cast it): bcmath's own grammar — optional
+     *   sign, digits, optional fraction, nothing else (no whitespace,
+     *   exponent or trailing newline).
+     *
+     * The `bcmath.scale` ini is ignored: a non-default scale used to append a
+     * fraction ("…000.00" at 2), which was never a valid ingest timestamp.
+     *
+     * Deliberately stricter than bcmath: null, bool and digitless strings
+     * (`''`, a lone sign or dot, `'-.'`), which it read as 0 (or 1 for
+     * `true`), are rejected.
+     */
+    private static function nanosecondTimestamp(mixed $ms): ?string
+    {
+        if (is_int($ms)) {
+            return $ms === 0 ? '0' : $ms . '000000';
+        }
+        if (is_float($ms) || $ms instanceof \Stringable) {
+            // The cast bcmath was handed. NAN and INF cast to "NAN"/"INF" and
+            // fail the grammar below; a throwing __toString is buildEntry's.
+            $ms = (string) $ms;
+        } elseif (!is_string($ms)) {
+            return null;
+        }
+        // `\z`, not `$`: `$` would accept a trailing newline. `[0-9]`, not
+        // `\d`, so no locale or Unicode mode could ever widen the digit set.
+        if (preg_match('/^([+-]?)([0-9]*)(?:\.([0-9]*))?\z/', $ms, $m) !== 1 || $m[2] . ($m[3] ?? '') === '') {
+            return null;
+        }
+        $digits = ltrim($m[2] . substr(str_pad($m[3] ?? '', 6, '0'), 0, 6), '0');
+
+        return $digits === '' ? '0' : ($m[1] === '-' ? '-' : '') . $digits;
+    }
+
+    /**
      * Builds one queued entry, or reports the reason it could not be built and
      * returns null.
      *
      * Everything here runs on the caller's request path over the caller's own
      * values: a `JsonSerializable` in `$data` whose `jsonSerialize()` raises,
-     * a supplied `timestampProvider` that raises, a `bcmul()` that is not
-     * there because ext-bcmath is not installed. `json_encode` returning
+     * a supplied `timestampProvider` that raises. `json_encode` returning
      * `false` was already handled; an *exception* thrown out of any of it was
      * not, and would have escaped a log method whose entire contract is that
      * it never throws. So construction is guarded as a unit.
@@ -1487,7 +1537,20 @@ class Logger
     private function composeEntry(string $apiKey, string $level, string $message, array $data): ?array
     {
         $timestampMs = ($this->timestampProvider)();
-        $timestampNs = bcmul((string) $timestampMs, '1000000');
+        $timestampNs = self::nanosecondTimestamp($timestampMs);
+        if ($timestampNs === null) {
+            $this->reject(
+                'Failed to send log: log entry could not be built: timestampProvider must return'
+                . ' epoch milliseconds as an int, float, numeric string or Stringable, got '
+                . match (true) {
+                    // The cast is what was parsed, so it is what explains the rejection.
+                    is_float($timestampMs) => 'float ' . $timestampMs,
+                    is_string($timestampMs) => 'non-numeric string',
+                    default => get_debug_type($timestampMs),
+                }
+            );
+            return null;
+        }
 
         // Resolved once, so every field on this entry comes from the same
         // scope (PAPI-5336) — the request's own inside a scope, else the
