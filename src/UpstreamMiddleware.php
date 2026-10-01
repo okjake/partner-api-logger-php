@@ -6,7 +6,7 @@ namespace PartnerApi\Logger;
 
 use GuzzleHttp\Exception\ConnectException;
 use GuzzleHttp\Exception\RequestException;
-use GuzzleHttp\Promise\Create;
+use GuzzleHttp\Promise\RejectedPromise;
 use GuzzleHttp\Promise\PromiseInterface;
 use Psr\Http\Message\RequestInterface;
 use Psr\Http\Message\ResponseInterface;
@@ -108,7 +108,7 @@ final class UpstreamMiddleware
 
                     return $response;
                 },
-                function (mixed $reason) use ($scope, $seq, $started, $base, $attempt, $request): PromiseInterface {
+                function (mixed $reason) use ($scope, $seq, $started, $base, $attempt, $request): mixed {
                     if ($reason instanceof RequestException && $reason->getResponse() !== null) {
                         // An HTTP error status that `http_errors` (or another
                         // middleware below this one) turned into an
@@ -119,8 +119,14 @@ final class UpstreamMiddleware
                         $this->recordFailure($scope, $seq, $started, $base, $attempt, $request, $reason);
                     }
 
-                    // Rethrown unchanged — the caller's own exception.
-                    return Create::rejectionFor($reason);
+                    // Rethrown unchanged — the caller's own exception. (Not
+                    // `Create::rejectionFor()`: that needs guzzlehttp/promises
+                    // 1.4+, and composer allows any guzzle ^7.0.)
+                    if ($reason instanceof \Throwable) {
+                        throw $reason;
+                    }
+
+                    return new RejectedPromise($reason);
                 },
             );
         };

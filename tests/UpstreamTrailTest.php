@@ -476,6 +476,24 @@ class UpstreamTrailTest extends TestCase
         $this->assertGreaterThan(UpstreamTrail::MAX_BYTES, UpstreamTrail::byteLength([$newestDropped, ...$line['upstream']]));
     }
 
+    public function testTheCountCapAndTheByteCapTogether(): void
+    {
+        // 25 calls of ~1 KB: the count cap keeps the newest 20, then the byte
+        // cap drops the oldest of those until the trail fits 8 KB.
+        $logger = $this->logger();
+        $this->exchange($logger, 'corr-1', function (Logger $l): void {
+            for ($i = 0; $i < 25; $i++) {
+                $l->upstream($this->call("call-{$i}", ['message' => str_repeat('m', 1000)]));
+            }
+        });
+        $logger->flush();
+
+        $line = $this->responses()[0];
+        $this->assertSame(array_map(fn ($i) => "call-{$i}", range(18, 24)), $this->names($line), 'the newest 7, oldest first');
+        $this->assertTrue($line['_upstreamTruncated']);
+        $this->assertSame(18, $line['_upstreamDropped'], '5 by count + 13 by bytes, counted once each');
+    }
+
     public function testTheByteCapIsExact(): void
     {
         foreach ([8192 => 0, 8193 => 1] as $bytes => $expectedDropped) {
@@ -638,6 +656,33 @@ class UpstreamTrailTest extends TestCase
         $this->assertSame(' padded id', $normalise(['message' => ' padded id'])['message'], 'message is not trimmed');
         $this->assertSame('req_1', $normalise(['requestId' => '  req_1 '])['requestId'], 'requestId is trimmed');
         $this->assertSame('stripe', $normalise(['name' => '  stripe '])['name']);
+    }
+
+    public function testTrimsTheWhitespaceJavaScriptTrims(): void
+    {
+        $nbsp = "\u{00A0}";
+        // Nothing but Unicode whitespace is no name at all — as for ingest.
+        foreach (["{$nbsp}{$nbsp}", "\u{FEFF}", "\u{2028}\u{3000}", "\u{202F}\u{205F}\u{1680}\u{2000}\u{200A}"] as $blank) {
+            $this->assertSame(
+                '`name` must be a non-empty string',
+                UpstreamTrail::normalise($this->call('x', ['name' => $blank])),
+            );
+        }
+        $this->assertSame('`url` must be a non-empty string', UpstreamTrail::normalise($this->call('x', ['url' => "{$nbsp}\t"])));
+
+        // Leading/trailing Unicode whitespace goes; inner whitespace stays.
+        $call = UpstreamTrail::normalise($this->call('x', [
+            'name' => "{$nbsp}stripe{$nbsp}connect\u{3000}",
+            'method' => "\u{FEFF}POST",
+            'url' => "{$nbsp}https://api.stripe.com/v1/charges",
+            'requestId' => "{$nbsp}req_1{$nbsp}",
+            'errorCode' => "\u{2028}card_declined",
+        ]));
+        $this->assertSame("stripe{$nbsp}connect", $call['name']);
+        $this->assertSame('POST', $call['method']);
+        $this->assertSame('https://api.stripe.com/v1/charges', $call['url']);
+        $this->assertSame('req_1', $call['requestId']);
+        $this->assertSame('card_declined', $call['errorCode']);
     }
 
     public function testCutsOverLongTextFieldsToIngestsCaps(): void

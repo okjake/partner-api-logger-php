@@ -55,6 +55,17 @@
   that never opens a scope** — `setContext()` there stays logger-wide, which is
   conformant for PHP-FPM.
 
+### Changed
+
+- **`stats()` returns a fourth key, `upstreamDropped`.** Code comparing the
+  whole array (`assertSame([...], $logger->stats())`) must add it.
+- **Every ingest POST carries one more Guzzle request option,
+  `partner_api_logger_internal => true`** (`Logger::INTERNAL_REQUEST_OPTION`),
+  so an `upstreamMiddleware()` on a client the logger also uses never records
+  the logger's own POSTs. A test double that asserts the exact options array
+  passed to `ClientInterface::request()` must allow it. The wire is unchanged:
+  Guzzle does not send unknown options.
+
 ## 2.0.0
 
 Buffered, non-throwing delivery (PAPI-3672), bringing the PHP SDK to parity

@@ -72,6 +72,14 @@ final class UpstreamTrail
      */
     private const METHOD_PATTERN = '/^[A-Za-z][A-Za-z_-]*$/';
 
+    /**
+     * JavaScript's `String.prototype.trim()` set — WhiteSpace plus
+     * LineTerminator — which is what ingest trims with. PHP's `trim()` strips
+     * ASCII only, so a name of nothing but NBSPs would pass here and be
+     * rejected by ingest, and a leading NBSP would be kept here and cut there.
+     */
+    private const JS_WHITESPACE = '[\x{0009}-\x{000D}\x{0020}\x{00A0}\x{1680}\x{2000}-\x{200A}\x{2028}\x{2029}\x{202F}\x{205F}\x{3000}\x{FEFF}]';
+
     /** Largest `attempt` kept (ingest omits anything larger). */
     private const MAX_ATTEMPT = 1000;
 
@@ -350,7 +358,11 @@ final class UpstreamTrail
         if (!is_string($value)) {
             return null;
         }
-        $trimmed = trim(self::validUtf8($value));
+        $trimmed = (string) preg_replace(
+            '/^' . self::JS_WHITESPACE . '+|' . self::JS_WHITESPACE . '+$/u',
+            '',
+            self::validUtf8($value),
+        );
 
         return $trimmed === '' ? null : $trimmed;
     }

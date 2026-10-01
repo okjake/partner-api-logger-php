@@ -299,8 +299,8 @@ $logger->info($apiKey, 'Calling Stripe'); // carries THIS request's requestId
 
 - **`runWithContext($context, $fn)`** starts the scope as a copy of the current
   context merged with `$context`, runs `$fn`, and returns what `$fn` returns.
-  Inside it, `setContext()` — and the fields `logRequest()`/`logResponse()` set
-  — belong to that request only. Scopes nest. The previous scope comes back
+  Inside it, `setContext()` — and the fields `logRequest()`/`logResponse()`
+  set — belong to that request only. Scopes nest. The previous scope comes back
   when `$fn` returns **and** when it throws (the exception reaches you
   unchanged). `$fn` also receives a logger bound to the scope
   (`fn (Logger $scoped) => …`).
@@ -372,12 +372,13 @@ The response line then carries, in the order the calls were made:
   `durationMs`, and optionally `status`, `requestId`, `errorCode`, `message`
   and `attempt` — the spec's field names, exactly. `name` is any label you
   like; there is no registration. Omit `status` for a network error (no HTTP
-  response) and set `errorCode`. `attempt` is yours to set if you retry, or
-  is read from Guzzle's own retry counter by `upstreamMiddleware()` (see
-  Retries below); the SDK never guesses it. Numbers follow the TypeScript SDK's rules: `200.0` is
-  the status 200, the string `'200'` is not a status. A call missing
-  `name`/`method`/`url`, or with a `method` that is not an HTTP method
-  (letters, `-`, `_`; at most 16), a non-HTTP `status` or a bad `durationMs`, is
+  response) and set `errorCode`. `attempt` is yours to set if you retry, or is
+  read from Guzzle's own retry counter by `upstreamMiddleware()` (see Retries
+  below), where the first attempt is `0`; the SDK never guesses it. Numbers
+  follow the TypeScript SDK's rules: `200.0` is the status 200, the string
+  `'200'` is not a status. A call missing `name`/`method`/`url`, or with a
+  `method` that is not an HTTP method (letters, `-`, `_`; at most 16), a
+  non-HTTP `status` or a bad `durationMs`, is
   dropped and reported to `onError` — `upstream()` never throws.
 - **`$logger->upstreamMiddleware($name, $options = [])`** is the PHP
   counterpart of the TypeScript SDK's `wrapFetch`. Guzzle composes behaviour
@@ -397,7 +398,8 @@ The response line then carries, in the order the calls were made:
   - **Retries.** A `HandlerStack` nests in push order, so the first middleware
     pushed is the outermost. Push Guzzle's `Middleware::retry()` _before_ this
     one and every attempt is its own call, with `attempt` taken from the retry
-    middleware's own counter. Push it after, and a retried request is one call
+    middleware's own counter: `0` for the first attempt, `1` for the first
+    retry. Push it after, and a retried request is one call
     with no `attempt`.
   - **Redirects.** Pushed onto `HandlerStack::create()`, it sits inside the
     redirect middleware, so each redirect hop is its own call. `unshift()` it
