@@ -18,7 +18,8 @@ use PHPUnit\Framework\TestCase;
  * ext-bcmath — not declared in composer.json and absent from the official
  * `php:*-cli` images. On such a build every log call failed while building its
  * entry and was dropped, so nothing reached ingest. The timestamp is now built
- * with string concatenation, and the wire format must not move by a byte.
+ * with string operations, and for every value bcmath accepted — int, float or
+ * numeric string — the wire format must not move by a byte.
  */
 class TimestampTest extends TestCase
 {
@@ -28,16 +29,30 @@ class TimestampTest extends TestCase
     /** @var list<LoggerErrorEvent> */
     private array $reported = [];
 
+    private string|false $precision = false;
+
     protected function setUp(): void
     {
         $this->captured = [];
         $this->reported = [];
+        // A float's timestamp is whatever `(string) $float` keeps, exactly as
+        // it was under bcmath; pin PHP's default so the expectations hold.
+        $this->precision = ini_get('precision');
+        ini_set('precision', '14');
     }
 
-    /** @return array<string, array{int, string}> */
-    public static function millisecondTimestamps(): array
+    protected function tearDown(): void
+    {
+        if ($this->precision !== false) {
+            ini_set('precision', $this->precision);
+        }
+    }
+
+    /** @return array<string, array{int|float|string, string}> */
+    public static function acceptedTimestamps(): array
     {
         return [
+            // int — the default provider's type and the common case.
             'shared-fixture value' => [1234567890000, '1234567890000000000'],
             'representative now (2023-11-14)' => [1700000000000, '1700000000000000000'],
             // Every int must stay exact; a multiply would overflow to a float.
@@ -46,11 +61,35 @@ class TimestampTest extends TestCase
             'epoch' => [0, '0'],
             'before the epoch' => [-1, '-1000000'],
             'min signed 64-bit (PHP_INT_MIN)' => [PHP_INT_MIN, '-9223372036854775808000000'],
+
+            // float — e.g. a provider returning `microtime(true) * 1000` with
+            // no cast. Keeps the sub-ms digit the string cast keeps.
+            'uncast microtime() * 1000' => [1790859907529.123, '1790859907529100000'],
+            'half a millisecond' => [1234567890000.5, '1234567890000500000'],
+            'whole float' => [1234567890000.0, '1234567890000000000'],
+            'negative float' => [-1.5, '-1500000'],
+            'float truncated toward zero past 1 ns' => [1.2345678, '1234567'],
+            'negative float truncated toward zero' => [-1.2345678, '-1234567'],
+            'negative zero float' => [-0.0, '0'],
+
+            // string — bcmath's decimal grammar.
+            'digit string' => ['1234567890000', '1234567890000000000'],
+            'negative digit string' => ['-1', '-1000000'],
+            'digit string past PHP_INT_MAX' => ['9223372036854775808', '9223372036854775808000000'],
+            'leading zeros' => ['0012', '12000000'],
+            'explicit plus sign' => ['+5', '5000000'],
+            'negative zero string' => ['-0', '0'],
+            'decimal string' => ['1234567890000.5', '1234567890000500000'],
+            'string truncated toward zero past 1 ns' => ['1.2345678', '1234567'],
+            'negative string truncated toward zero' => ['-1.2345678', '-1234567'],
+            'sub-nanosecond string truncates to zero' => ['-0.0000009', '0'],
+            'bare fraction' => ['.5', '500000'],
+            'trailing dot' => ['5.', '5000000'],
         ];
     }
 
-    #[DataProvider('millisecondTimestamps')]
-    public function testTheEntryTimestampIsTheMillisecondsAsANanosecondString(int $ms, string $expectedNs): void
+    #[DataProvider('acceptedTimestamps')]
+    public function testTheEntryTimestampIsTheMillisecondsAsANanosecondString(int|float|string $ms, string $expectedNs): void
     {
         $logger = $this->logger(fn () => $ms);
 
@@ -63,38 +102,59 @@ class TimestampTest extends TestCase
     }
 
     /**
-     * Pins byte-identity with the `bcmul()` result this replaced, wherever
-     * bcmath happens to be loaded (CI installs it today). The literals in the
-     * test above carry the same guarantee on builds without it.
+     * Pins byte-identity with the `bcmul((string) $ms, '1000000')` this
+     * replaced, wherever bcmath happens to be loaded (CI installs it today).
+     * The literals above carry the same guarantee on builds without it.
      */
-    #[DataProvider('millisecondTimestamps')]
-    public function testTheTimestampIsByteIdenticalToTheBcmathProductItReplaced(int $ms, string $expectedNs): void
+    #[DataProvider('acceptedTimestamps')]
+    public function testTheTimestampIsByteIdenticalToTheBcmathProductItReplaced(int|float|string $ms, string $expectedNs): void
     {
-        if (!extension_loaded('bcmath')) {
-            $this->markTestSkipped('ext-bcmath is not loaded; the literal expectations still apply.');
-        }
+        $this->requireBcmath();
 
         $this->assertSame(\bcmul((string) $ms, '1000000'), $expectedNs);
     }
 
-    /** @return array<string, array{mixed, string}> */
-    public static function nonIntegerTimestamps(): array
+    public function testAFloatKeepsWhatTheStringCastKeepsUnderThePrecisionIni(): void
+    {
+        ini_set('precision', '17');
+        $logger = $this->logger(fn () => 1790859907529.123);
+
+        $logger->info('app-key', 'hello');
+        $logger->flush();
+
+        $this->assertSame('1790859907529123000', $this->captured[0]['options']['json']['entries'][0]['timestamp']);
+    }
+
+    /** @return array<string, array{mixed, string, bool}> value, how the message names it, whether bcmath rejected it too */
+    public static function rejectedTimestamps(): array
     {
         return [
-            'float' => [1234567890000.0, 'float'],
-            'numeric string' => ['1234567890000', 'string'],
-            'null' => [null, 'null'],
+            'NAN' => [NAN, 'float NAN', true],
+            'INF' => [INF, 'float INF', true],
+            '-INF' => [-INF, 'float -INF', true],
+            'float from 1e15 up (exponent form)' => [1e15, 'float 1.0E+15', true],
+            'float outside the int range' => [1e19, 'float 1.0E+19', true],
+            'tiny float (exponent form)' => [9.0E-7, 'float 9.0E-7', true],
+            'non-numeric string' => ['soon', 'non-numeric string', true],
+            'exponent string' => ['1e3', 'non-numeric string', true],
+            'hex string' => ['0x1A', 'non-numeric string', true],
+            'leading whitespace' => [' 12', 'non-numeric string', true],
+            'trailing newline' => ["12\n", 'non-numeric string', true],
+            'array' => [[], 'array', true],
+            'object' => [new \stdClass(), 'stdClass', true],
+            // Stricter than bcmath, which read these as 0 (1 for true): a
+            // 1970 timestamp is never what a provider meant.
+            'empty string' => ['', 'non-numeric string', false],
+            'sign only' => ['-', 'non-numeric string', false],
+            'dot only' => ['.', 'non-numeric string', false],
+            'null' => [null, 'null', false],
+            'true' => [true, 'bool', false],
+            'false' => [false, 'bool', false],
         ];
     }
 
-    /**
-     * The provider's contract is `callable(): int` epoch milliseconds — the
-     * default provider casts, and every documented and tested use passes an
-     * int. Anything else is reported as an invalid entry naming the type,
-     * never sent with a guessed timestamp.
-     */
-    #[DataProvider('nonIntegerTimestamps')]
-    public function testANonIntegerTimestampIsAnInvalidEntry(mixed $returned, string $type): void
+    #[DataProvider('rejectedTimestamps')]
+    public function testAValueThatIsNotATimestampIsAnInvalidEntry(mixed $returned, string $got, bool $bcmathRejectedIt): void
     {
         $logger = $this->logger(fn () => $returned);
 
@@ -106,18 +166,37 @@ class TimestampTest extends TestCase
         $this->assertSame(LoggerErrorEvent::REASON_INVALID_ENTRY, $this->reported[0]->reason);
         $this->assertSame(
             'Failed to send log: log entry could not be built: timestampProvider must return'
-            . ' integer epoch milliseconds, got ' . $type,
+            . ' epoch milliseconds as an int, float or numeric string, got ' . $got,
             $this->reported[0]->message,
         );
         $this->assertSame(1, $logger->stats()['dropped']);
     }
 
-    public function testANonIntegerTimestampThrowsInDirectMode(): void
+    /**
+     * Pins exactly where the replacement is stricter than bcmath, and that it
+     * is nowhere looser: every other rejected shape made bcmath throw too.
+     */
+    #[DataProvider('rejectedTimestamps')]
+    public function testRejectionsMatchBcmathExceptTheNamedTightenings(mixed $returned, string $got, bool $bcmathRejectedIt): void
     {
-        $logger = $this->logger(fn () => 1234567890000.0, ['mode' => Logger::MODE_DIRECT]);
+        $this->requireBcmath();
+
+        try {
+            \bcmul(@(string) $returned, '1000000');
+            $bcmathThrew = false;
+        } catch (\Throwable) {
+            $bcmathThrew = true;
+        }
+
+        $this->assertSame($bcmathRejectedIt, $bcmathThrew);
+    }
+
+    public function testANonTimestampThrowsInDirectMode(): void
+    {
+        $logger = $this->logger(fn () => NAN, ['mode' => Logger::MODE_DIRECT]);
 
         $this->expectException(LoggerException::class);
-        $this->expectExceptionMessage('timestampProvider must return integer epoch milliseconds, got float');
+        $this->expectExceptionMessage('as an int, float or numeric string, got float NAN');
 
         $logger->info('app-key', 'hello');
     }
@@ -213,6 +292,13 @@ class TimestampTest extends TestCase
         $this->assertNotEmpty($calls, 'the scan found no calls at all; it is broken, not passing');
 
         return $calls;
+    }
+
+    private function requireBcmath(): void
+    {
+        if (!extension_loaded('bcmath')) {
+            $this->markTestSkipped('ext-bcmath is not loaded; the literal expectations still apply.');
+        }
     }
 
     private function logger(callable $timestampProvider, array $options = []): Logger

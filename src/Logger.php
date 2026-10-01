@@ -147,7 +147,7 @@ class Logger
     private array $context = [];
     private ClientInterface $httpClient;
 
-    /** @var callable(): int */
+    /** @var callable(): (int|float|string) Epoch ms; see nanosecondTimestamp(). */
     private $timestampProvider;
 
     /** @var callable(LoggerErrorEvent): void */
@@ -802,6 +802,48 @@ class Logger
     }
 
     /**
+     * Epoch milliseconds → the decimal nanosecond string ingest expects, or
+     * null for a value that is not a timestamp.
+     *
+     * Up to 2.0.0 this was bcmath's multiply of `(string) $ms` by 1000000 at
+     * scale 0. That needs ext-bcmath — never declared, and absent from the
+     * official php images — so there every entry failed (FLT-1306). This
+     * reproduces the same bytes without it: a multiply by 10^6 is a six-place
+     * decimal shift, truncated toward zero as scale 0 truncates.
+     *
+     * - int: append six zeros. Exact even at PHP_INT_MAX, where a multiply
+     *   would overflow to a float.
+     * - float: the same `(string)` cast bcmath was handed, so it keeps what
+     *   that cast keeps under the `precision` ini (one sub-ms digit at the
+     *   default 14). NAN/INF, and the exponent form the cast produces from
+     *   1e15 up and for tiny values, are rejected — bcmath rejected them too.
+     * - string: bcmath's own grammar — optional sign, digits, optional
+     *   fraction, nothing else (no whitespace, exponent or trailing newline).
+     *
+     * Deliberately stricter than bcmath: null, bool and the digitless strings
+     * `''`, `'-'`, `'.'`, which it read as 0 (or 1 for `true`), are rejected.
+     */
+    private static function nanosecondTimestamp(mixed $ms): ?string
+    {
+        if (is_int($ms)) {
+            return $ms === 0 ? '0' : $ms . '000000';
+        }
+        if (is_float($ms)) {
+            // NAN and INF cast to "NAN"/"INF" and fail the grammar below.
+            $ms = (string) $ms;
+        } elseif (!is_string($ms)) {
+            return null;
+        }
+        // `\z`, not `$`: `$` would accept a trailing newline.
+        if (preg_match('/^([+-]?)(\d*)(?:\.(\d*))?\z/', $ms, $m) !== 1 || $m[2] . ($m[3] ?? '') === '') {
+            return null;
+        }
+        $digits = ltrim($m[2] . substr(str_pad($m[3] ?? '', 6, '0'), 0, 6), '0');
+
+        return $digits === '' ? '0' : ($m[1] === '-' ? '-' : '') . $digits;
+    }
+
+    /**
      * Builds one queued entry, or reports the reason it could not be built and
      * returns null.
      *
@@ -837,19 +879,20 @@ class Logger
     private function composeEntry(string $apiKey, string $level, string $message, array $data): ?array
     {
         $timestampMs = ($this->timestampProvider)();
-        if (!is_int($timestampMs)) {
+        $timestampNs = self::nanosecondTimestamp($timestampMs);
+        if ($timestampNs === null) {
             $this->reject(
                 'Failed to send log: log entry could not be built: timestampProvider must return'
-                . ' integer epoch milliseconds, got ' . get_debug_type($timestampMs)
+                . ' epoch milliseconds as an int, float or numeric string, got '
+                . match (true) {
+                    // The cast is what was parsed, so it is what explains the rejection.
+                    is_float($timestampMs) => 'float ' . $timestampMs,
+                    is_string($timestampMs) => 'non-numeric string',
+                    default => get_debug_type($timestampMs),
+                }
             );
             return null;
         }
-        // ms → ns by appending six zeros, not by multiplying: exact for every
-        // int (PHP_INT_MAX * 1000000 overflows to a float) and needs no
-        // ext-bcmath, which the official php images do not ship (FLT-1306).
-        // Byte-identical to the bcmath multiply it replaces; 0 is the one int
-        // where appending would differ from that canonical "0".
-        $timestampNs = $timestampMs === 0 ? '0' : $timestampMs . '000000';
 
         $contextDefaults = array_filter([
             'request_id' => $this->context['requestId'] ?? null,
