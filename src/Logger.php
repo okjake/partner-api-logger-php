@@ -1052,6 +1052,11 @@ class Logger
                 'correlation_id' => $response['correlationId'],
             ];
         } catch (\Throwable $e) {
+            // The exchange still answered: end it and clear its trail, as a
+            // delivered response would. The calls are lost with the line,
+            // which reject() reports; leaving them would ship them on the
+            // NEXT response and keep this exchange open for nested scopes.
+            $this->responseTrail();
             $this->reject('Failed to send log: response could not be described: ' . $e->getMessage());
 
             return;

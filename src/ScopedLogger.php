@@ -17,7 +17,7 @@ namespace PartnerApi\Logger;
  * It is a `Logger` so it can go anywhere one is type-hinted, but it never runs
  * `Logger`'s constructor, so it carries no logger state of its own: EVERY
  * public `Logger` method must be overridden here to delegate.
- * `ScopedLoggerTest::testEveryPublicLoggerMethodIsDelegated` fails the build
+ * `RequestScopeTest::testEveryPublicLoggerMethodIsDelegated` fails the build
  * if one is added to `Logger` and not here.
  *
  * @internal Obtain one from `Logger::child()`; never construct it directly.

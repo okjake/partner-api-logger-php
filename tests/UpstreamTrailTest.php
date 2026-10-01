@@ -148,6 +148,33 @@ class UpstreamTrailTest extends TestCase
         $this->assertArrayNotHasKey('upstream', $this->responses()[0]);
     }
 
+    public function testAMalformedResponseStillClearsTheTrailAndEndsTheExchange(): void
+    {
+        $logger = $this->logger();
+        $request = $logger->child();
+        $request->logRequest(self::KEY, ['method' => 'GET', 'path' => '/x', 'headers' => ['x-correlation-id' => 'bad']]);
+        $request->upstream($this->call('lost-with-the-malformed-line'));
+
+        // Laravel promotes the missing-key warning to an exception.
+        set_error_handler(static function (int $no, string $str, string $file, int $line): bool {
+            throw new \ErrorException($str, 0, $no, $file, $line);
+        });
+        try {
+            $request->logResponse(self::KEY, ['duration' => 1, 'correlationId' => 'bad']);
+        } finally {
+            restore_error_handler();
+        }
+
+        // The exchange is over: a child opened now is top-level, not pulled.
+        $request->child()->upstream($this->call('after'));
+        $this->exchange($request, 'next');
+        $logger->flush();
+
+        $this->assertStringStartsWith('Failed to send log: response could not be described: ', $this->reported[0]->message);
+        $this->assertSame(['next'], array_column($this->responses(), 'correlation_id'));
+        $this->assertArrayNotHasKey('upstream', $this->responses()[0], 'the malformed exchange\'s calls did not leak onto the next');
+    }
+
     // ---------------------------------------------------------- per request
 
     public function testEachScopeShipsOnlyItsOwnCalls(): void
@@ -468,6 +495,47 @@ class UpstreamTrailTest extends TestCase
         }
     }
 
+    public function testTheByteCapCountsSlashesAsTheShippedLineEncodesThem(): void
+    {
+        // The line is encoded with JSON_UNESCAPED_SLASHES, so a `/` costs one
+        // byte on the wire. A slash-heavy trail that fills exactly 8192 bytes
+        // of the shipped line is kept whole; counted with escaped slashes
+        // (`\/`, two bytes) it would wrongly lose its oldest call.
+        $bulk = ['url' => 'https://vendor.test/' . str_repeat('a/', 250)];
+
+        [$line, $bytes] = $this->shipTrail($this->callsOccupying(8192, $bulk));
+        $this->assertSame(8192, $bytes, 'the trail fills exactly 8192 bytes of the shipped line');
+        $this->assertArrayNotHasKey('_upstreamTruncated', $line);
+
+        [$line, $bytes] = $this->shipTrail($this->callsOccupying(8193, $bulk));
+        $this->assertSame(1, $line['_upstreamDropped'], 'one byte over: the oldest call goes');
+        $this->assertSame('c1', $line['upstream'][0]['name']);
+        $this->assertLessThanOrEqual(8192, $bytes);
+    }
+
+    public function testTheByteCapCountsNonAsciiAsTheShippedLineEncodesThem(): void
+    {
+        // PHP escapes é as é (6 bytes) inside the line. The cap must
+        // count those bytes, not the 2 of raw UTF-8: under-counting would
+        // ship a trail over 8192 bytes of line.
+        $bulk = ['message' => str_repeat("\u{e9}", 80)];
+
+        [$line, $bytes] = $this->shipTrail($this->callsOccupying(8192, $bulk));
+        $this->assertSame(8192, $bytes);
+        $this->assertArrayNotHasKey('_upstreamTruncated', $line);
+        $raw = UpstreamTrail::byteLength($line['upstream']);
+        $this->assertSame($bytes, $raw, 'byteLength is exactly the bytes in the shipped line');
+        $this->assertGreaterThanOrEqual(
+            strlen(json_encode($line['upstream'], JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE)),
+            $raw,
+            'never below the raw UTF-8 that ingest measures',
+        );
+
+        [$line, $bytes] = $this->shipTrail($this->callsOccupying(8193, $bulk));
+        $this->assertSame(1, $line['_upstreamDropped']);
+        $this->assertLessThanOrEqual(8192, $bytes);
+    }
+
     public function testBoundsMemoryAsCallsArriveNotOnlyAtTheResponse(): void
     {
         $trail = new UpstreamTrail();
@@ -781,6 +849,55 @@ class UpstreamTrailTest extends TestCase
     private function expectedPlainResponse(): string
     {
         return '{"level":"info","message":"Outgoing response","path":"/orders","method":"GET","status_code":200,"duration_ms":12,"correlation_id":"corr-1","headers":null,"body":null}';
+    }
+
+    /**
+     * Calls whose trail occupies exactly `$bytes` bytes of a log line, encoded
+     * as the line is (JSON_UNESCAPED_SLASHES, written out here rather than
+     * read from the SDK, so a test cannot inherit the SDK's mistake): bulk
+     * calls carrying `$bulk`, then one ASCII call sized to land on the byte.
+     *
+     * @param array<string, mixed> $bulk
+     * @return list<array<string, mixed>>
+     */
+    private function callsOccupying(int $bytes, array $bulk): array
+    {
+        $wire = static fn (array $calls): int => strlen(json_encode($calls, JSON_UNESCAPED_SLASHES));
+        $tail = fn (int $pad): array => $this->call('tail', ['message' => str_repeat('x', $pad)]);
+        $calls = [];
+        while ($wire([...$calls, $this->call('c' . count($calls), $bulk), $tail(1)]) <= $bytes) {
+            $calls[] = $this->call('c' . count($calls), $bulk);
+        }
+        $calls[] = $tail(1 + $bytes - $wire([...$calls, $tail(1)]));
+        $this->assertSame($bytes, $wire($calls));
+
+        return $calls;
+    }
+
+    /**
+     * Records `$calls` in one exchange and returns the response line and the
+     * number of bytes its `upstream` array occupies in the RAW shipped line.
+     *
+     * @param list<array<string, mixed>> $calls
+     * @return array{0: array<string, mixed>, 1: int}
+     */
+    private function shipTrail(array $calls): array
+    {
+        $this->captured = [];
+        $logger = $this->logger();
+        $this->exchange($logger, 'sized', function (Logger $l) use ($calls): void {
+            foreach ($calls as $call) {
+                $l->upstream($call);
+            }
+        });
+        $logger->flush();
+
+        $raw = $this->rawLines()[1];
+        $start = strpos($raw, '"upstream":') + strlen('"upstream":');
+        $end = strpos($raw, ',"_upstreamTruncated"');
+        $end = $end === false ? strlen($raw) - 1 : $end;
+
+        return [$this->responses()[0], $end - $start];
     }
 
     /**

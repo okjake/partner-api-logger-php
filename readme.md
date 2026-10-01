@@ -372,8 +372,9 @@ The response line then carries, in the order the calls were made:
   `durationMs`, and optionally `status`, `requestId`, `errorCode`, `message`
   and `attempt` — the spec's field names, exactly. `name` is any label you
   like; there is no registration. Omit `status` for a network error (no HTTP
-  response) and set `errorCode`. `attempt` is yours to set if you retry; the
-  SDK never guesses it. Numbers follow the TypeScript SDK's rules: `200.0` is
+  response) and set `errorCode`. `attempt` is yours to set if you retry, or
+  is read from Guzzle's own retry counter by `upstreamMiddleware()` (see
+  Retries below); the SDK never guesses it. Numbers follow the TypeScript SDK's rules: `200.0` is
   the status 200, the string `'200'` is not a status. A call missing
   `name`/`method`/`url`, or with a `method` that is not an HTTP method
   (letters, `-`, `_`; at most 16), a non-HTTP `status` or a bad `durationMs`, is
