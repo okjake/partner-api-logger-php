@@ -48,7 +48,7 @@ class TimestampTest extends TestCase
         }
     }
 
-    /** @return array<string, array{int|float|string, string}> */
+    /** @return array<string, array{int|float|string|\Stringable, string}> */
     public static function acceptedTimestamps(): array
     {
         return [
@@ -85,11 +85,15 @@ class TimestampTest extends TestCase
             'sub-nanosecond string truncates to zero' => ['-0.0000009', '0'],
             'bare fraction' => ['.5', '500000'],
             'trailing dot' => ['5.', '5000000'],
+
+            // Stringable — e.g. Brick\Math\BigInteger::of('1700000000000');
+            // bcmath's string parameter cast it.
+            'Stringable' => [new StringableTimestamp('1700000000000'), '1700000000000000000'],
         ];
     }
 
     #[DataProvider('acceptedTimestamps')]
-    public function testTheEntryTimestampIsTheMillisecondsAsANanosecondString(int|float|string $ms, string $expectedNs): void
+    public function testTheEntryTimestampIsTheMillisecondsAsANanosecondString(int|float|string|\Stringable $ms, string $expectedNs): void
     {
         $logger = $this->logger(fn () => $ms);
 
@@ -107,7 +111,7 @@ class TimestampTest extends TestCase
      * The literals above carry the same guarantee on builds without it.
      */
     #[DataProvider('acceptedTimestamps')]
-    public function testTheTimestampIsByteIdenticalToTheBcmathProductItReplaced(int|float|string $ms, string $expectedNs): void
+    public function testTheTimestampIsByteIdenticalToTheBcmathProductItReplaced(int|float|string|\Stringable $ms, string $expectedNs): void
     {
         $this->requireBcmath();
 
@@ -142,11 +146,15 @@ class TimestampTest extends TestCase
             'trailing newline' => ["12\n", 'non-numeric string', true],
             'array' => [[], 'array', true],
             'object' => [new \stdClass(), 'stdClass', true],
+            'non-numeric Stringable' => [new StringableTimestamp('soon'), StringableTimestamp::class, true],
             // Stricter than bcmath, which read these as 0 (1 for true): a
             // 1970 timestamp is never what a provider meant.
             'empty string' => ['', 'non-numeric string', false],
             'sign only' => ['-', 'non-numeric string', false],
             'dot only' => ['.', 'non-numeric string', false],
+            'plus only' => ['+', 'non-numeric string', false],
+            'minus dot' => ['-.', 'non-numeric string', false],
+            'plus dot' => ['+.', 'non-numeric string', false],
             'null' => [null, 'null', false],
             'true' => [true, 'bool', false],
             'false' => [false, 'bool', false],
@@ -330,5 +338,18 @@ class TimestampTest extends TestCase
         );
 
         return $client;
+    }
+}
+
+/** A provider value that is not a string but casts to one, like a Brick\Math number. */
+final class StringableTimestamp implements \Stringable
+{
+    public function __construct(private readonly string $value)
+    {
+    }
+
+    public function __toString(): string
+    {
+        return $this->value;
     }
 }

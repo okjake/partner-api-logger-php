@@ -817,19 +817,26 @@ class Logger
      *   that cast keeps under the `precision` ini (one sub-ms digit at the
      *   default 14). NAN/INF, and the exponent form the cast produces from
      *   1e15 up and for tiny values, are rejected — bcmath rejected them too.
-     * - string: bcmath's own grammar — optional sign, digits, optional
-     *   fraction, nothing else (no whitespace, exponent or trailing newline).
+     * - string, or a Stringable such as a Brick\Math number (cast first, as
+     *   bcmath's string parameter cast it): bcmath's own grammar — optional
+     *   sign, digits, optional fraction, nothing else (no whitespace,
+     *   exponent or trailing newline).
      *
-     * Deliberately stricter than bcmath: null, bool and the digitless strings
-     * `''`, `'-'`, `'.'`, which it read as 0 (or 1 for `true`), are rejected.
+     * The `bcmath.scale` ini is ignored: a non-default scale used to append a
+     * fraction ("…000.00" at 2), which was never a valid ingest timestamp.
+     *
+     * Deliberately stricter than bcmath: null, bool and digitless strings
+     * (`''`, a lone sign or dot, `'-.'`), which it read as 0 (or 1 for
+     * `true`), are rejected.
      */
     private static function nanosecondTimestamp(mixed $ms): ?string
     {
         if (is_int($ms)) {
             return $ms === 0 ? '0' : $ms . '000000';
         }
-        if (is_float($ms)) {
-            // NAN and INF cast to "NAN"/"INF" and fail the grammar below.
+        if (is_float($ms) || $ms instanceof \Stringable) {
+            // The cast bcmath was handed. NAN and INF cast to "NAN"/"INF" and
+            // fail the grammar below; a throwing __toString is buildEntry's.
             $ms = (string) $ms;
         } elseif (!is_string($ms)) {
             return null;
