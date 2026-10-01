@@ -2,6 +2,21 @@
 
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- **No longer needs ext-bcmath** (FLT-1306). The entry timestamp was built
+  with `bcmul()`, which composer.json never required and the official
+  `php:*-cli` images do not ship, so on such a build every log call failed
+  while building its entry and was dropped as `invalid-entry` — nothing
+  reached ingest. It is now plain string arithmetic, and the `timestamp` on
+  the wire is byte-identical (epoch milliseconds followed by six zeros, `"0"`
+  for 0). A `timestampProvider` must return an `int` of epoch milliseconds,
+  as its `callable(): int` annotation always said; anything else is now
+  reported as `invalid-entry` naming the type, where bcmath used to coerce a
+  float or numeric string.
+
 ## 2.0.0
 
 Buffered, non-throwing delivery (PAPI-3672), bringing the PHP SDK to parity
