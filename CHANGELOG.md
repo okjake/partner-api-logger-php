@@ -10,12 +10,12 @@
   with `bcmul()`, which composer.json never required and the official
   `php:*-cli` images do not ship, so on such a build every log call failed
   while building its entry and was dropped as `invalid-entry` — nothing
-  reached ingest. It is now plain string arithmetic, and the `timestamp` on
-  the wire is byte-identical (epoch milliseconds followed by six zeros, `"0"`
-  for 0). A `timestampProvider` must return an `int` of epoch milliseconds,
-  as its `callable(): int` annotation always said; anything else is now
-  reported as `invalid-entry` naming the type, where bcmath used to coerce a
-  float or numeric string.
+  reached ingest. It is now built with plain string operations, and the
+  `timestamp` on the wire is byte-identical for everything a
+  `timestampProvider` could return before — an int, a float such as an
+  uncast `microtime(true) * 1000`, or a numeric string. A provider returning
+  `null`, a bool or an empty string, never a real timestamp, is now reported
+  as `invalid-entry` rather than sent as a 1970 timestamp.
 
 ## 2.0.0
 
