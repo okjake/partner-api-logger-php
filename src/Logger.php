@@ -807,8 +807,7 @@ class Logger
      *
      * Everything here runs on the caller's request path over the caller's own
      * values: a `JsonSerializable` in `$data` whose `jsonSerialize()` raises,
-     * a supplied `timestampProvider` that raises, a `bcmul()` that is not
-     * there because ext-bcmath is not installed. `json_encode` returning
+     * a supplied `timestampProvider` that raises. `json_encode` returning
      * `false` was already handled; an *exception* thrown out of any of it was
      * not, and would have escaped a log method whose entire contract is that
      * it never throws. So construction is guarded as a unit.
@@ -838,7 +837,19 @@ class Logger
     private function composeEntry(string $apiKey, string $level, string $message, array $data): ?array
     {
         $timestampMs = ($this->timestampProvider)();
-        $timestampNs = bcmul((string) $timestampMs, '1000000');
+        if (!is_int($timestampMs)) {
+            $this->reject(
+                'Failed to send log: log entry could not be built: timestampProvider must return'
+                . ' integer epoch milliseconds, got ' . get_debug_type($timestampMs)
+            );
+            return null;
+        }
+        // ms → ns by appending six zeros, not by multiplying: exact for every
+        // int (PHP_INT_MAX * 1000000 overflows to a float) and needs no
+        // ext-bcmath, which the official php images do not ship (FLT-1306).
+        // Byte-identical to the bcmath multiply it replaces; 0 is the one int
+        // where appending would differ from that canonical "0".
+        $timestampNs = $timestampMs === 0 ? '0' : $timestampMs . '000000';
 
         $contextDefaults = array_filter([
             'request_id' => $this->context['requestId'] ?? null,
