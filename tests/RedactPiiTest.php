@@ -10,6 +10,7 @@ declare(strict_types=1);
 namespace PartnerApi\Logger\Tests;
 
 use PartnerApi\Logger\RedactPii;
+use PartnerApi\Logger\RedactPiiFoldTable;
 use function PartnerApi\Logger\redactPII;
 use PHPUnit\Framework\TestCase;
 use PHPUnit\Framework\Attributes\DataProvider;
@@ -410,5 +411,154 @@ class RedactPiiTest extends TestCase
             'id=[ID]',
             RedactPii::redact("id=$uuid", ['redactUuids' => true]),
         );
+    }
+
+    /*
+     * FLT-1191 — what the PHP port has to get right that the shared corpus
+     * does not reach: strings that are not valid UTF-8, integer keys, the
+     * Unicode spaces JavaScript's `\s` takes, the compatibility fold, the
+     * phone context window counted in JavaScript characters, and the URL
+     * parse `new URL()` runs. Every expected value below is what
+     * `@partner-api/logger`'s `redactPII` returns for the same input, except
+     * where a comment says otherwise.
+     */
+
+    public function testInvalidUtf8IsRedactedNotFailed(): void
+    {
+        // Under the `u` modifier every rule would fail on these bytes.
+        $this->assertSame(
+            "caf\xE9 [EMAIL_REDACTED] \xFF [PHONE_REDACTED] \xC2",
+            RedactPii::redact("caf\xE9 jane@realco-invented.test \xFF +44 20 7946 0000 \xC2"),
+        );
+    }
+
+    public function testAnIntegerKeyIsRedactedLikeAStringKey(): void
+    {
+        // PHP turns the JSON key "4111111111111111" into an int key.
+        $this->assertSame(
+            ['[CARD_REDACTED]' => 'a', 'n' => [7, '[EMAIL_REDACTED]']],
+            RedactPii::redact([4111111111111111 => 'a', 'n' => [7, 'jane@realco-invented.test']]),
+        );
+        $this->assertSame([0 => '[EMAIL_REDACTED]', 1 => 2], RedactPii::redact(['jane@realco-invented.test', 2]));
+    }
+
+    #[DataProvider('javascriptSpaces')]
+    public function testUnicodeSpacesCountAsJavaScriptWhitespace(string $input, string $expected): void
+    {
+        $this->assertSame($expected, RedactPii::redact($input));
+    }
+
+    public static function javascriptSpaces(): array
+    {
+        return [
+            'Bearer then NBSP' => ["Bearer\u{A0}abc.def", 'Bearer [TOKEN_REDACTED]'],
+            'Bearer then line separator' => ["Bearer\u{2028}abc.def", 'Bearer [TOKEN_REDACTED]'],
+            'a password ends at NBSP' => ["password=hunter2\u{A0}rest", "password=[PASSWORD_REDACTED]\u{A0}rest"],
+            'a card grouped by NBSP' => ["card 4111\u{A0}1111\u{A0}1111\u{A0}1111", 'card [CARD_REDACTED]'],
+            'a URL ends at an ideographic space' => ["https://h.test/p?q=1\u{3000}next", "https://h.test/p?[QUERY_REDACTED]\u{3000}next"],
+        ];
+    }
+
+    #[DataProvider('foldedPhones')]
+    public function testPhoneRuleMatchesOnTheCompatibilityFold(string $input, string $expected): void
+    {
+        $this->assertSame($expected, RedactPii::redact($input));
+    }
+
+    public static function foldedPhones(): array
+    {
+        return [
+            'mathematical digits' => ["tel +44 \u{1D7D0}\u{1D7CE} 7946 0000 end", 'tel [PHONE_REDACTED] end'],
+            'zero-width space and soft hyphen' => ["tel +44\u{200B}20\u{AD}7946 0000 end", 'tel [PHONE_REDACTED] end'],
+            'minus signs' => ["tel +44\u{2212}20\u{2212}7946\u{2212}0000 end", 'tel [PHONE_REDACTED] end'],
+            'the telephone sign is the word tel' => ["\u{2121} 4155550132", "\u{2121} [PHONE_REDACTED]"],
+            'a quoted-printable soft break' => ["line=\nphone +44 20 7946 0000", "line=\nphone [PHONE_REDACTED]"],
+        ];
+    }
+
+    public function testTheFoldTableFoldsEveryUnicodeSpaceDashAndAtLookalike(): void
+    {
+        foreach (["\u{A0}", "\u{1680}", "\u{2000}", "\u{2005}", "\u{200A}", "\u{202F}", "\u{205F}", "\u{3000}"] as $space) {
+            $this->assertSame(' ', RedactPiiFoldTable::FOLD[$space] ?? null, bin2hex($space));
+        }
+        foreach (["\u{2010}", "\u{2013}", "\u{2014}", "\u{2212}", "\u{FE63}"] as $dash) {
+            $this->assertSame('-', RedactPiiFoldTable::FOLD[$dash] ?? null, bin2hex($dash));
+        }
+        foreach (["\u{FE6B}", "\u{24B6}", "\u{24D0}", "\u{249C}", "\u{1F110}", "\u{1F130}", "\u{1F150}", "\u{1F170}"] as $at) {
+            $this->assertSame('@', RedactPiiFoldTable::FOLD[$at] ?? null, bin2hex($at));
+        }
+        foreach (["\u{AD}", "\u{200B}", "\u{FEFF}"] as $invisible) {
+            $this->assertSame('', RedactPiiFoldTable::FOLD[$invisible] ?? null, bin2hex($invisible));
+        }
+        $this->assertSame('2', RedactPiiFoldTable::FOLD["\u{B2}"]);
+        $this->assertSame('1', RedactPiiFoldTable::FOLD["\u{2460}"]);
+        $this->assertArrayNotHasKey("\u{E9}", RedactPiiFoldTable::FOLD);
+    }
+
+    /**
+     * The 15-character window around ten bare digits is counted in UTF-16
+     * code units, as JavaScript counts it: nine CJK characters (27 bytes) and
+     * a space still reach `phone`, ten do not; an emoji counts twice.
+     */
+    #[DataProvider('contextWindows')]
+    public function testPhoneContextWindowCountsJavaScriptCharacters(string $between, bool $redacted): void
+    {
+        $input = "phone{$between} 4155550132";
+        $this->assertSame(
+            $redacted ? "phone{$between} [PHONE_REDACTED]" : $input,
+            RedactPii::redact($input),
+        );
+    }
+
+    public static function contextWindows(): array
+    {
+        return [
+            'nine CJK characters' => [str_repeat("\u{4E2D}", 9), true],
+            'ten CJK characters' => [str_repeat("\u{4E2D}", 10), false],
+            'four emoji' => [str_repeat("\u{1F600}", 4), true],
+            'five emoji' => [str_repeat("\u{1F600}", 5), false],
+        ];
+    }
+
+    /**
+     * The query rule rebuilds the URL as JavaScript's
+     * `${url.protocol}//${url.host}${url.pathname}` does.
+     */
+    #[DataProvider('urls')]
+    public function testUrlWithoutItsQueryIsTheWhatwgSerialisation(string $input, string $expected): void
+    {
+        $this->assertSame(
+            $expected,
+            RedactPii::redact($input, ['redactEmails' => false, 'redactIpAddresses' => false]),
+        );
+    }
+
+    public static function urls(): array
+    {
+        return [
+            'userinfo, default port, case, dot segments, backslash and fragment' => [
+                'see https://u:p@H.Example.TEST:443/a/./b/../c\\d?x=1#frag',
+                'see https://h.example.test/a/c/d?[QUERY_REDACTED]',
+            ],
+            'an IPv6 host is compressed' => ['see https://[2001:DB8:0:0:0:0:0:1]/p?q=1', 'see https://[2001:db8::1]/p?[QUERY_REDACTED]'],
+            'an IPv4-mapped IPv6 host is written in hex' => ['see https://[::ffff:1.2.3.4]/p?q=1', 'see https://[::ffff:102:304]/p?[QUERY_REDACTED]'],
+            'a hex IPv4 host is normalised' => ['see https://0x7f.1/p?q=1', 'see https://127.0.0.1/p?[QUERY_REDACTED]'],
+            'a percent-encoded host is decoded' => ['see https://%41pi.test/p?q=1', 'see https://api.test/p?[QUERY_REDACTED]'],
+            'a path is percent-encoded' => ["see https://h.test/a\"c<d>`{}\u{E9}?q=1", 'see https://h.test/a%22c%3Cd%3E%60%7B%7D%C3%A9?[QUERY_REDACTED]'],
+            'encoded dot segments resolve' => ['see https://h.test/%2e%2E/x/%2e?q=1', 'see https://h.test/x/?[QUERY_REDACTED]'],
+            'extra slashes before the host' => ['see https:///h.test?q=1', 'see https://h.test/?[QUERY_REDACTED]'],
+            'a padded default port is still default' => ['see http://h.test:0080/?q=1', 'see http://h.test/?[QUERY_REDACTED]'],
+            'a padded port is unpadded' => ['see https://h.test:0080/?q=1', 'see https://h.test:80/?[QUERY_REDACTED]'],
+            'an empty port' => ['see https://h.test:/p?q=1', 'see https://h.test/p?[QUERY_REDACTED]'],
+            'an empty query is kept' => ['see https://h.test/p?#frag', 'see https://h.test/p?#frag'],
+            'a bare question mark is kept' => ['see https://h.test/p?', 'see https://h.test/p?'],
+            'an out-of-range IPv4 host does not parse' => ['see https://1.2.3.256/p?q=1', 'see https://1.2.3.256/p?[QUERY_REDACTED]'],
+            'an out-of-range port does not parse' => ['see https://h.test:99999/p?q=1', 'see https://h.test:99999/p?[QUERY_REDACTED]'],
+            'an empty host does not parse' => ['see https://user@/p?q=1', 'see https://user@/p?[QUERY_REDACTED]'],
+            // JavaScript converts a non-ASCII host to punycode
+            // (`xn--caf-dma.test`); without ext-intl PHP cannot, so the URL
+            // takes the unparseable branch. The query goes either way.
+            'a non-ASCII host keeps its spelling' => ["see https://caf\u{E9}.test/p?q=1", "see https://caf\u{E9}.test/p?[QUERY_REDACTED]"],
+        ];
     }
 }
