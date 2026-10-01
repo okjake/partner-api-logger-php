@@ -65,6 +65,47 @@
   the logger's own POSTs. A test double that asserts the exact options array
   passed to `ClientInterface::request()` must allow it. The wire is unchanged:
   Guzzle does not send unknown options.
+- **`redactPII` meets the shared redaction corpus (FLT-1191).** The PHP helper
+  was a third hand-kept copy of the ruleset that had fallen behind
+  `@partner-api/logger` 3.1.0. It now carries the same rules, in the same
+  order, and `tests/RedactPiiCorpusTest.php` runs it against
+  `packages/database/src/pii-redaction-corpus.json` — the contract the
+  platform sanitiser and the JavaScript SDK already meet (PAPI-4859) — so a
+  rule added there fails this suite until it is ported here.
+- **More is redacted.** Issuer-prefixed credentials are redacted whole: GitHub
+  (`ghp_`, `github_pat_`, …), AWS key ids, Slack, Stripe, model-provider,
+  Google, npm and GitLab keys, and Partner API `tenant_live_`, `psa_` and
+  `papi_admin_` tokens — including one glued to a name by `_` (PAPI-4859). An
+  international phone number loses its national digits with its country code
+  (`+44 20 7946 0000`, grouped by NBSP or another Unicode space, `&nbsp;` or
+  fullwidth digits included) and keeps a status code, date, unit or name
+  written after it. A card, token, JWT, IP address or Bearer header straight
+  after a JSON string escape (`\n`) is redacted, a JWT after a dash is
+  redacted, and with `redactUuids` a UUID glued to a word is redacted.
+- **Keys, not only values (PAPI-4960).** An array key that is itself PII — a
+  phone number, an email address, a card, a credential — is redacted like a
+  value. Two keys that redact alike keep both values, the second under `#2`,
+  the third `#3`. An identifier-shaped key (`token_expires_at`, a UUID, an IP
+  address) stays readable, and a sensitive key still keeps its key and loses
+  its value. A `__proto__` key is dropped, as the JavaScript helper drops it
+  (PAPI-4797), so both log the same thing.
+- **Less is redacted.** A signed count or duration (`+12`, `+30s`,
+  `delta=+200ms`) is no longer a phone number. A URL's host is never
+  redacted, and a long REST path keeps its words and loses only its id-shaped
+  pieces (`/api/v1/customers/[ENCODED_KEY_REDACTED]/orders`) where it used to
+  go whole with the host's TLD (FLT-1107). A base64 run holding `/`, `+` or
+  `=` padding still goes whole, and a URL an earlier rule left unparseable
+  still loses its query.
+- **Linear time and memory.** Every rule runs in time and memory linear in
+  its input, with PCRE's JIT on or off: a 1 MB string of any of the shapes
+  that make a backtracking rule quadratic is redacted in under a second and
+  under 48 MB of peak memory at the default 128 MB `memory_limit`
+  (`tests/RedactPiiLinearTimeTest.php`).
+- **No fail-open.** A PCRE error — a backtrack or JIT stack limit — used to
+  return the string it was redacting unchanged (`preg_replace(...) ?? $text`).
+  Now that string comes back as `[REDACTION_FAILED]`, whole, and a key that
+  fails becomes `[REDACTION_FAILED]` too. The helper still never throws: it
+  runs on logging paths that must not break the request they describe.
 
 ### Fixed
 

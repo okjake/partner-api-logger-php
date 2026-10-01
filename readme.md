@@ -473,7 +473,23 @@ The response line then carries, in the order the calls were made:
 
 ## PII Redaction Helper
 
-For call sites that need to redact PII before passing user data into a downstream system whose logs you don't control, the package exposes a public `redactPII()` helper. The ruleset mirrors what the ingest service applies internally — emails, JWTs, Bearer tokens, named API-key prefixes, passwords, phone numbers, credit cards, IPv4/IPv6 addresses, and URL query strings.
+For call sites that need to redact PII before passing user data into a downstream system whose logs you don't control, the package exposes a public `redactPII()` helper. The ruleset is the one the ingest service applies internally and `@partner-api/logger`'s `redactPII` applies in JavaScript; all three meet the same redaction corpus, and the PHP test suite fails if this copy drifts from it.
+
+What it redacts in a string:
+
+- **Emails, JWTs, Bearer tokens and `access_token=` / `refresh_token=` assignments.**
+- **Issuer-prefixed credentials, whole:** GitHub (`ghp_`, `github_pat_`, …), AWS key ids, Slack, Stripe, model-provider, Google, npm and GitLab keys, and Partner API `tenant_live_`, `psa_` and `papi_admin_` tokens — including one glued to a name by `_`. Generic `sk-` / `pk_` / `rk_` / `ak_` / `key_` / `token_` prefixes, 32+ character runs and 40+ character base64 runs go too.
+- **Passwords** in `password=` / `pwd:` assignments and `"password": "…"` JSON.
+- **Phone numbers.** An international number loses its national digits with its country code (`+44 20 7946 0000`), however it is grouped — spaces, dots, dashes, brackets, NBSP and the other Unicode spaces, `&nbsp;`, fullwidth digits — and a status code, byte count, date, time, unit or name written after it stays. A signed count or duration (`+12`, `+30s`, `delta=+200ms`) is not a phone number. Ten bare digits are redacted only near a word like `phone`, `mobile` or `call`.
+- **Card numbers, CVVs and IPv4/IPv6 addresses.**
+- **URL query strings:** `https://host/path?…` keeps its host and path and becomes `https://host/path?[QUERY_REDACTED]`, even when an earlier rule has left the URL unparseable. The URL is written back as a browser would normalise it (no userinfo or fragment, default port dropped, `..` resolved). One difference from the JavaScript helper: a host outside ASCII (`café.test`) is not converted to punycode, because that needs ext-intl. It is kept as written, and the query is still removed.
+- **UUIDs**, only with `redactUuids` (also when glued to a word, `task_[ID]`).
+
+A card, token, JWT, IP address, phone number or Bearer header straight after a JSON string escape (`\n`, `\t`, `\"`, `\u00e9`) is redacted too, so PII inside JSON stored as text does not slip through. A URL's host is never redacted, and a long REST path keeps its words and loses only the id-shaped pieces (`/api/v1/customers/[ENCODED_KEY_REDACTED]/orders`); a base64 run holding `/`, `+` or `=` padding still goes whole.
+
+In an array, a **sensitive key** (`password`, `apiKey`, `clientSecret`, `accessToken`, `cookie`, …) keeps its key and loses its value, whatever the value is. A **key that is itself PII** — a phone number, an email address, a credential — is redacted like a value, and two keys that redact alike keep both values, the second under `#2`, the third `#3`. A key that is only identifier-shaped (`token_expires_at`, a UUID, an IP address) stays readable. A `__proto__` key is dropped, as the JavaScript helper drops it, so both log the same thing. Lists are walked item by item.
+
+Every rule runs in time and memory linear in its input, with PCRE's JIT on or off. The test suite holds a 1 MB string of each adversarial shape (2–3 MB of UTF-8 for the non-ASCII ones) to under a second and under 48 MB of peak memory, in a process with the default 128 MB `memory_limit`; measured, the worst is about 0.6 s and 20 MB. Much larger strings need memory in proportion — roughly ten times their size at worst — so truncate multi-megabyte values before redacting them on a small worker. No rule fails open: if PHP's regex engine reports an error on a string — its backtrack or JIT stack limit — that string comes back as `[REDACTION_FAILED]`, never unredacted or half-redacted. A key that fails becomes `[REDACTION_FAILED]` too. The helper does not throw, because it is called on logging paths that must not break the request they describe; running out of `memory_limit` is a PHP fatal error, not an exception, which is what the memory bound above is for. No PHP extension beyond the core is needed.
 
 ```php
 use PartnerApi\Logger\RedactPii;
@@ -503,6 +519,10 @@ redactPII([
 // Query strings (encoded as associative array)
 redactPII(['user' => 'alice', 'api_key' => 'sk-livetestkey1234567890']);
 // → ['user' => 'alice', 'api_key' => '[KEY_REDACTED]']
+
+// Keys that are themselves PII
+redactPII(['+44 20 7946 0000' => 'sent', '+44 20 7946 0001' => 'failed']);
+// → ['[PHONE_REDACTED]' => 'sent', '[PHONE_REDACTED]#2' => 'failed']
 ```
 
 Use the static form `RedactPii::redact(...)` when a use-function import is awkward. Options:
@@ -522,7 +542,7 @@ RedactPii::redact($input, [
 ]);
 ```
 
-The original input is never mutated — a redacted copy is returned. Scalars (int/float/bool) and `null` pass through untouched.
+The original input is never mutated — a redacted copy is returned. Scalars (int/float/bool) and `null` pass through untouched. **Objects pass through untouched too, unredacted** — a `stdClass` from `json_decode($json)` without `true`, a `JsonSerializable`, any other instance — so decode to arrays (`json_decode($json, true)`) before redacting.
 
 ## Metrics
 
