@@ -440,6 +440,11 @@ long-running worker (the `cli` SAPI: Octane, RoadRunner, Swoole,
 `queue:work`) it does not keep a logger alive, so a dropped logger is
 collected; one dropped with entries still buffered drains them as it is
 destroyed (see [What this costs your request](#what-this-costs-your-request)).
+FrankenPHP in classic mode (one request per lifecycle) reports the
+`frankenphp` SAPI, so it gets the long-running behaviour too: the
+destroy-time drain, bounded by `autoDrainTimeoutMs`. Nothing is lost; only
+the timing differs from PHP-FPM. NGINX Unit's SAPI is outside the
+per-request list too, and behaves the same way.
 
 A child forked with `pcntl_fork()` inherits the parent's buffer and pending
 end-of-request drain, and delivers the parent's buffered entries again when it

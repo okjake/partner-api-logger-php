@@ -438,6 +438,68 @@ final class ShutdownDrainTest extends TestCase
     }
 
     /**
+     * The drain's loss accounting when a clock fault meets a full buffer: an
+     * auto-drain sets a refused chunk aside to go back on the buffer, the
+     * clock then throws, and putting it back overflows `maxBufferSize`. The
+     * overflowed entry is reported once, as `buffer-overflow`; the
+     * `flush-failed` report counts exactly the entries the fault cost.
+     */
+    public function testAClockFaultOnAFullBufferCountsEachLostEntryOnce(): void
+    {
+        $broken = false;
+        $logger = null;
+        $logger = new Logger(
+            tenantToken: 'tenant-token',
+            baseUrl: 'https://ingest.test',
+            httpClient: new RecordingTransport(function (string $method, string $url, array $request) use (&$broken, &$logger): Response {
+                // Ingest refuses the first chunk (retryable: set aside for
+                // later) while three fresh entries fill the buffer; then the
+                // clock breaks before the second chunk.
+                foreach (['x', 'y', 'z'] as $message) {
+                    $logger->info('key-c', $message);
+                }
+                $broken = true;
+                throw new ConnectException('cURL error 7: Failed to connect', new Request('POST', $url));
+            }),
+            options: [
+                'flushOnShutdown' => false,
+                'maxBufferSize' => 3,
+                'batchSize' => 3,
+                'onError' => function (LoggerErrorEvent $event): void {
+                    $this->reported[] = $event;
+                },
+                'clock' => function () use (&$broken): float {
+                    if ($broken) {
+                        throw new \RuntimeException('clock broke');
+                    }
+
+                    return $this->now;
+                },
+            ],
+        );
+
+        // Two groups: key-a (1 entry, refused) and key-b (2 entries, never
+        // reached). The third entry triggers the auto-drain.
+        $logger->info('key-a', 'a');
+        $logger->info('key-b', 'b1');
+        $logger->info('key-b', 'b2');
+
+        $reports = array_map(
+            static fn (LoggerErrorEvent $event) => [$event->reason, $event->entryCount],
+            $this->reported,
+        );
+        $this->assertSame([
+            [LoggerErrorEvent::REASON_BUFFER_OVERFLOW, 1],
+            [LoggerErrorEvent::REASON_FLUSH_FAILED, 2],
+        ], $reports);
+        // Six entries in all: three buffered (x, y, z), three dropped.
+        $this->assertSame(['buffered' => 3, 'delivered' => 0, 'dropped' => 3], array_intersect_key(
+            $logger->stats(),
+            ['buffered' => 0, 'delivered' => 0, 'dropped' => 0],
+        ));
+    }
+
+    /**
      * Where every static resets when the request ends (PHP-FPM and friends)
      * nothing can leak, so 2.1.0's behaviour holds exactly: the hook keeps
      * the logger, delivers after the response is finished, and nothing

@@ -1301,8 +1301,7 @@ class Logger
             }
 
             if ($requeue !== []) {
-                $rebuffered = count($requeue);
-                $this->rebuffer($requeue);
+                $rebuffered = $this->rebufferCounted($requeue);
                 $requeue = [];
             }
 
@@ -1324,8 +1323,7 @@ class Logger
             // Every entry of the batch not yet delivered, dropped (and
             // reported) or put back on the buffer is lost here; count it.
             if ($requeue !== []) {
-                $rebuffered += count($requeue);
-                $this->rebuffer($requeue);
+                $rebuffered += $this->rebufferCounted($requeue);
             }
             $lost = max(0, count($batch)
                 - ($this->deliveredTotal - $deliveredBefore)
@@ -1392,6 +1390,22 @@ class Logger
     {
         $this->buffer = array_merge($entries, $this->buffer);
         $this->trimBuffer();
+    }
+
+    /**
+     * {@see self::rebuffer()}, returning how far the buffer grew: what it
+     * kept, net of any overflow that trimming dropped (and already counted
+     * and reported as `buffer-overflow`). drain()'s loss accounting subtracts
+     * this, so an overflowed entry is never counted as both dropped and kept.
+     *
+     * @param list<array<string, mixed>> $entries
+     */
+    private function rebufferCounted(array $entries): int
+    {
+        $before = count($this->buffer);
+        $this->rebuffer($entries);
+
+        return count($this->buffer) - $before;
     }
 
     /** Monotonic milliseconds. */
