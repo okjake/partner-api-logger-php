@@ -816,7 +816,8 @@ class Logger
      * - float: the same `(string)` cast bcmath was handed, so it keeps what
      *   that cast keeps under the `precision` ini (one sub-ms digit at the
      *   default 14). NAN/INF, and the exponent form the cast produces from
-     *   1e15 up and for tiny values, are rejected — bcmath rejected them too.
+     *   10^precision up (1e14 at the default 14) and for tiny values, are
+     *   rejected — bcmath rejected them too.
      * - string, or a Stringable such as a Brick\Math number (cast first, as
      *   bcmath's string parameter cast it): bcmath's own grammar — optional
      *   sign, digits, optional fraction, nothing else (no whitespace,
@@ -841,8 +842,9 @@ class Logger
         } elseif (!is_string($ms)) {
             return null;
         }
-        // `\z`, not `$`: `$` would accept a trailing newline.
-        if (preg_match('/^([+-]?)(\d*)(?:\.(\d*))?\z/', $ms, $m) !== 1 || $m[2] . ($m[3] ?? '') === '') {
+        // `\z`, not `$`: `$` would accept a trailing newline. `[0-9]`, not
+        // `\d`, so no locale or Unicode mode could ever widen the digit set.
+        if (preg_match('/^([+-]?)([0-9]*)(?:\.([0-9]*))?\z/', $ms, $m) !== 1 || $m[2] . ($m[3] ?? '') === '') {
             return null;
         }
         $digits = ltrim($m[2] . substr(str_pad($m[3] ?? '', 6, '0'), 0, 6), '0');
@@ -890,7 +892,7 @@ class Logger
         if ($timestampNs === null) {
             $this->reject(
                 'Failed to send log: log entry could not be built: timestampProvider must return'
-                . ' epoch milliseconds as an int, float or numeric string, got '
+                . ' epoch milliseconds as an int, float, numeric string or Stringable, got '
                 . match (true) {
                     // The cast is what was parsed, so it is what explains the rejection.
                     is_float($timestampMs) => 'float ' . $timestampMs,

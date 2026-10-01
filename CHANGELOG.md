@@ -9,14 +9,20 @@
 - **No longer needs ext-bcmath** (FLT-1306). The entry timestamp was built
   with `bcmul()`, which composer.json never required and the official
   `php:*-cli` images do not ship, so on such a build every log call failed
-  while building its entry and was dropped as `invalid-entry` — nothing
-  reached ingest. It is now built with plain string operations, and the
-  `timestamp` on the wire is byte-identical for everything a
-  `timestampProvider` could return before — an int, a float such as an
-  uncast `microtime(true) * 1000`, a numeric string, or a `Stringable` such
+  while building its entry and was dropped as `invalid-entry` (or, in
+  `MODE_DIRECT`, threw `LoggerException`) — nothing reached ingest. It is now
+  built with plain string operations, and at the default `bcmath.scale` of 0
+  the `timestamp` on the wire is byte-identical for every value a
+  `timestampProvider` returned that bcmath accepted — an int, a float such as
+  an uncast `microtime(true) * 1000`, a numeric string, or a `Stringable` such
   as a `Brick\Math` number. A provider returning `null`, a bool or an empty
   string, never a real timestamp, is now reported as `invalid-entry` rather
   than sent as a 1970 timestamp.
+- **No fractional timestamp when `bcmath.scale` is set** (FLT-1306). With a
+  non-zero `bcmath.scale` ini the timestamp went out as e.g.
+  `"1700000000000000000.00"`, which ingest rejects with a 400 — losing the
+  whole batch it was in. The timestamp is now always a whole number of
+  nanoseconds, whatever that ini says.
 
 ## 2.0.0
 

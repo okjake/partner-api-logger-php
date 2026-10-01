@@ -18,8 +18,8 @@ use PHPUnit\Framework\TestCase;
  * ext-bcmath — not declared in composer.json and absent from the official
  * `php:*-cli` images. On such a build every log call failed while building its
  * entry and was dropped, so nothing reached ingest. The timestamp is now built
- * with string operations, and for every value bcmath accepted — int, float or
- * numeric string — the wire format must not move by a byte.
+ * with string operations, and for every value bcmath accepted — int, float,
+ * numeric string or Stringable — the wire format must not move by a byte.
  */
 class TimestampTest extends TestCase
 {
@@ -129,6 +129,28 @@ class TimestampTest extends TestCase
         $this->assertSame('1790859907529123000', $this->captured[0]['options']['json']['entries'][0]['timestamp']);
     }
 
+    /**
+     * Under a non-zero `bcmath.scale` the old code sent "…000.00", which
+     * ingest rejects with a 400 for the whole batch. The ini is now ignored.
+     */
+    public function testANonZeroBcmathScaleNoLongerProducesAFractionalTimestamp(): void
+    {
+        $this->requireBcmath();
+        $scale = ini_get('bcmath.scale');
+        ini_set('bcmath.scale', '2');
+        try {
+            $this->assertSame('1700000000000000000.00', \bcmul('1700000000000', '1000000'), 'precondition: the old fractional output');
+
+            $logger = $this->logger(fn () => 1700000000000);
+            $logger->info('app-key', 'hello');
+            $logger->flush();
+
+            $this->assertSame('1700000000000000000', $this->captured[0]['options']['json']['entries'][0]['timestamp']);
+        } finally {
+            ini_set('bcmath.scale', (string) $scale);
+        }
+    }
+
     /** @return array<string, array{mixed, string, bool}> value, how the message names it, whether bcmath rejected it too */
     public static function rejectedTimestamps(): array
     {
@@ -136,7 +158,8 @@ class TimestampTest extends TestCase
             'NAN' => [NAN, 'float NAN', true],
             'INF' => [INF, 'float INF', true],
             '-INF' => [-INF, 'float -INF', true],
-            'float from 1e15 up (exponent form)' => [1e15, 'float 1.0E+15', true],
+            // The cast switches to exponent form at 10^precision (pinned to 14).
+            'float from 1e14 up (exponent form)' => [1e14, 'float 1.0E+14', true],
             'float outside the int range' => [1e19, 'float 1.0E+19', true],
             'tiny float (exponent form)' => [9.0E-7, 'float 9.0E-7', true],
             'non-numeric string' => ['soon', 'non-numeric string', true],
@@ -174,7 +197,7 @@ class TimestampTest extends TestCase
         $this->assertSame(LoggerErrorEvent::REASON_INVALID_ENTRY, $this->reported[0]->reason);
         $this->assertSame(
             'Failed to send log: log entry could not be built: timestampProvider must return'
-            . ' epoch milliseconds as an int, float or numeric string, got ' . $got,
+            . ' epoch milliseconds as an int, float, numeric string or Stringable, got ' . $got,
             $this->reported[0]->message,
         );
         $this->assertSame(1, $logger->stats()['dropped']);
@@ -204,7 +227,7 @@ class TimestampTest extends TestCase
         $logger = $this->logger(fn () => NAN, ['mode' => Logger::MODE_DIRECT]);
 
         $this->expectException(LoggerException::class);
-        $this->expectExceptionMessage('as an int, float or numeric string, got float NAN');
+        $this->expectExceptionMessage('as an int, float, numeric string or Stringable, got float NAN');
 
         $logger->info('app-key', 'hello');
     }
