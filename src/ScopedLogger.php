@@ -34,6 +34,15 @@ final class ScopedLogger extends Logger
     ) {
     }
 
+    /**
+     * Nothing to drain: the buffer is the root's, and the root's own
+     * destructor drains it. Inheriting Logger's would read state this object
+     * never initialised.
+     */
+    public function __destruct()
+    {
+    }
+
     public function setContext(array $fields): void
     {
         $this->root->withScope($this->scope, fn () => $this->root->setContext($fields));

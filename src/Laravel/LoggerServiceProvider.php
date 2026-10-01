@@ -2,6 +2,7 @@
 
 namespace PartnerApi\Logger\Laravel;
 
+use Illuminate\Contracts\Container\Container;
 use Illuminate\Support\ServiceProvider;
 use PartnerApi\Logger\Logger;
 
@@ -43,25 +44,33 @@ class LoggerServiceProvider extends ServiceProvider
         // Since 2.0.0 log calls buffer instead of posting (see the Logger
         // docblock), so something has to drain the buffer at the end of the
         // request. A `terminating` callback is the right hook: Laravel runs it
-        // from `Application::terminate()`, after the response has already been
-        // sent — and, unlike a `register_shutdown_function`, it fires once per
-        // request on long-lived workers (Octane, queues, `artisan serve`)
-        // rather than once when the worker process finally dies.
+        // from `Application::terminate()` after the response has been sent,
+        // once per HTTP request — including on Octane, where the Logger's
+        // shutdown function fires only when the worker process exits.
         //
-        // The Logger arms its own shutdown-function fallback as well, and a
-        // second flush on an empty buffer is a no-op, so a request that
-        // somehow bypasses `terminate()` still delivers.
         // Lumen's container has no terminate() lifecycle; there the Logger's
-        // own shutdown-function fallback is the only drain, which is fine.
+        // own shutdown-function drain is the only one, which is fine.
         if (!method_exists($this->app, 'terminating')) {
             return;
         }
 
-        $this->app->terminating(function () {
+        // Drain the logger THIS request used, resolved from the container
+        // terminate() runs on — never `$this->app`, the app this provider
+        // booted with (FLT-1522). Octane clones that app into a sandbox per
+        // request and points `app` at the clone; an un-warmed Logger is first
+        // resolved in the sandbox, so the boot-time app has never seen it.
+        // `terminate()` invokes callbacks through `$this->call()` (every
+        // Laravel from 8 to 13), which injects `Container` as the `app`
+        // binding: the sandbox under Octane, the application everywhere else.
+        //
+        // `static` so the callback captures neither the provider nor its app.
+        // Queued jobs are not drained here: `queue:work` terminates once, when
+        // the worker exits (see the readme, "Delivery and errors").
+        $this->app->terminating(static function (Container $app): void {
             // Resolving here would construct a Logger for every request that
             // never logged, purely to flush nothing.
-            if ($this->app->resolved(Logger::class)) {
-                $this->app->make(Logger::class)->flush();
+            if ($app->resolved(Logger::class)) {
+                $app->make(Logger::class)->flush();
             }
         });
     }

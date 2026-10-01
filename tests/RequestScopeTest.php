@@ -361,24 +361,35 @@ class RequestScopeTest extends TestCase
 
     public function testTheShutdownDrainRunsOutsideEveryScope(): void
     {
-        $logger = $this->logger();
-        $scopeProperty = new \ReflectionProperty(Logger::class, 'currentScope');
-        $seenDuringDrain = [];
-        $this->onPost = function () use ($logger, $scopeProperty, &$seenDuringDrain): void {
-            $seenDuringDrain[] = $scopeProperty->getValue($logger);
-        };
-
-        // As after an `exit` inside runWithContext(): the finally that would
-        // have restored the scope has not run when the shutdown hook fires.
-        $logger->runWithContext(['partnerId' => 'request'], function () use ($logger, $scopeProperty): void {
-            $logger->info(self::KEY, 'queued');
-            $stuck = $scopeProperty->getValue($logger);
-            $this->assertNotNull($stuck);
-            (new \ReflectionMethod(Logger::class, 'drainOnShutdown'))->invoke($logger);
-            $this->assertSame($stuck, $scopeProperty->getValue($logger), 'restored after the drain');
+        // The real process-wide hook, captured instead of registered.
+        $hooks = [];
+        Logger::overrideShutdownHook(static function (callable $hook) use (&$hooks): void {
+            $hooks[] = $hook;
         });
 
-        $this->assertCount(1, $this->captured);
-        $this->assertSame([null], $seenDuringDrain, 'the drain ran at the root scope');
+        try {
+            $logger = $this->logger(['flushOnShutdown' => true]);
+            $scopeProperty = new \ReflectionProperty(Logger::class, 'currentScope');
+            $seenDuringDrain = [];
+            $this->onPost = function () use ($logger, $scopeProperty, &$seenDuringDrain): void {
+                $seenDuringDrain[] = $scopeProperty->getValue($logger);
+            };
+
+            // As after an `exit` inside runWithContext(): the finally that would
+            // have restored the scope has not run when the shutdown hook fires.
+            $logger->runWithContext(['partnerId' => 'request'], function () use ($logger, $scopeProperty, &$hooks): void {
+                $logger->info(self::KEY, 'queued');
+                $stuck = $scopeProperty->getValue($logger);
+                $this->assertNotNull($stuck);
+                $this->assertCount(1, $hooks);
+                ($hooks[0])();
+                $this->assertSame($stuck, $scopeProperty->getValue($logger), 'restored after the drain');
+            });
+
+            $this->assertCount(1, $this->captured);
+            $this->assertSame([null], $seenDuringDrain, 'the drain ran at the root scope');
+        } finally {
+            Logger::overrideShutdownHook();
+        }
     }
 }

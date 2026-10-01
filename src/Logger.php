@@ -21,13 +21,19 @@ use Ramsey\Uuid\Uuid;
  *
  * 1. `flush()` — deliver what is buffered at call time. Always available.
  * 2. `batchSize` — reaching it drains automatically (default 100 entries).
- * 3. A `register_shutdown_function` hook, armed on the first buffered entry.
- *    It calls `fastcgi_finish_request()` first where the SAPI provides it, so
- *    the client already has its response before a single byte goes to ingest.
+ * 3. A process-wide `register_shutdown_function` hook, registered once, on
+ *    the first buffered entry. It calls `fastcgi_finish_request()` first where
+ *    the SAPI provides it, so the client already has its response before a
+ *    single byte goes to ingest, then drains every logger still holding
+ *    entries. It holds loggers weakly (FLT-1522): a logger dropped before
+ *    shutdown is collected as usual, and drains its buffer as it is destroyed.
  *
- * Under Laravel the service provider additionally registers a `terminating`
- * callback, which runs earlier than the shutdown hook and works on long-lived
- * workers (Octane, queues) where per-request shutdown functions never fire.
+ * A shutdown function fires once per PROCESS, so on a long-lived worker
+ * (Octane, RoadRunner, a queue worker) (3) is not an end-of-request drain.
+ * Under Laravel the service provider registers a `terminating` callback that
+ * drains the logger the request used after every HTTP request — under Octane
+ * that is the request sandbox's logger (FLT-1522). Nothing drains per queued
+ * job: call `flush()` at the end of each job.
  *
  * **What a caller can be made to wait for.** Only (2) runs inside a log call,
  * and it is deliberately cheap: one attempt per batch, the drain *as a whole*
@@ -247,7 +253,6 @@ class Logger
     /** @var list<array{apiKey: string, labels: array<string, string>, root: array<string, string>, entry: array{timestamp: string, line: string}}> */
     private array $buffer = [];
 
-    private bool $shutdownArmed = false;
     private bool $draining = false;
 
     /**
@@ -259,6 +264,33 @@ class Logger
 
     private int $deliveredTotal = 0;
     private int $droppedTotal = 0;
+
+    /**
+     * Loggers holding entries the process-wide shutdown drain must deliver
+     * (FLT-1522). The keys are weak, so being in here never keeps a logger
+     * alive: a per-request logger on a long-lived worker (an un-warmed
+     * Octane sandbox's) is collected like any other object and drops out.
+     * Until 2.1.1 each logger registered its own shutdown function, a closure
+     * over `$this`, which pinned every per-request logger — and its buffer,
+     * Guzzle client and options — until the worker exited.
+     *
+     * Null until first use: a `WeakMap` cannot be a property initialiser.
+     *
+     * @var \WeakMap<Logger, true>|null
+     */
+    private static ?\WeakMap $awaitingShutdown = null;
+
+    /** Whether the one shutdown hook is registered and has not run yet. */
+    private static bool $shutdownHookPending = false;
+
+    /** Set once the hook has finished the response, so it never does twice. */
+    private static bool $responseFinished = false;
+
+    /** @var (\Closure(callable): void)|null See overrideShutdownHook(). */
+    private static ?\Closure $registerShutdownHook = null;
+
+    /** @var (\Closure(): void)|null See overrideShutdownHook(). */
+    private static ?\Closure $finishResponse = null;
 
     /**
      * @param array{
@@ -313,8 +345,9 @@ class Logger
      *   dropped. Bounds the drain that runs inside the FPM request after
      *   `fastcgi_finish_request()` — keep it well under the pool's
      *   `request_terminate_timeout`, or FPM kills the worker mid-drain.
-     * - `flushOnShutdown` — arm the `register_shutdown_function` drain
-     *   (default true).
+     * - `flushOnShutdown` — drain from the process-wide
+     *   `register_shutdown_function` hook, and when the logger is destroyed
+     *   with entries still buffered (default true).
      * - `finishRequestOnShutdown` — call `fastcgi_finish_request()` before that
      *   drain where the SAPI has it (default true), so delivery happens after
      *   the client already has its response.
@@ -340,7 +373,9 @@ class Logger
         $this->tenantToken = $tenantToken;
         $this->baseUrl = $baseUrl ?? 'https://ingest.partnerapi.com';
         $this->httpClient = $httpClient ?? new Client();
-        $this->timestampProvider = $timestampProvider ?? fn () => (int) (microtime(true) * 1000);
+        // `static`: a closure that captured `$this` would make every logger
+        // a reference cycle, freed only when the cycle collector next runs.
+        $this->timestampProvider = $timestampProvider ?? static fn () => (int) (microtime(true) * 1000);
 
         // Same reasoning as the unknown-key check above, and the same blast
         // radius: `PARTNER_API_LOG_MODE=diret` silently coercing to buffered
@@ -1095,6 +1130,17 @@ class Logger
      */
     public function flush(): void
     {
+        $this->flushFrom(null);
+    }
+
+    /**
+     * {@see Logger::flush()}, with the `drainDeadlineMs` budget counted from
+     * `$startedAtMs` (this logger's clock) instead of from now. The shutdown
+     * hook passes the moment it started, so draining several loggers costs
+     * the process one budget, not one each.
+     */
+    private function flushFrom(?float $startedAtMs): void
+    {
         // PAPI-5337: dropped upstream calls the rate limit held back are
         // reported now, so a burst is never left unreported at the end of a
         // request. (The `batchSize` drain does not come through here.)
@@ -1103,15 +1149,16 @@ class Logger
         } catch (\Throwable) {
             // A caller-supplied `clock` that throws; flush() never throws.
         }
-        $this->drain(self::DRAIN_FULL);
+        $this->drain(self::DRAIN_FULL, $startedAtMs);
     }
 
     /**
      * Takes the buffer and posts it under the given drain profile.
      *
      * @param self::DRAIN_AUTO|self::DRAIN_FULL $profile
+     * @param float|null $startedAtMs When the budget started; null is now.
      */
-    private function drain(string $profile): void
+    private function drain(string $profile, ?float $startedAtMs = null): void
     {
         // `onError` runs inside the drain; a hook that logs through this same
         // logger would otherwise re-enter and post the batch it is reporting on.
@@ -1129,7 +1176,7 @@ class Logger
         // only the attempt leaves the log call costing groups × the timeout —
         // 4 s for a request that logged at four levels. `0` disables.
         $budget = $profile === self::DRAIN_AUTO ? $this->autoDrainTimeoutMs : $this->drainDeadlineMs;
-        $deadline = $budget > 0 ? $this->clockMs() + $budget : null;
+        $deadline = $budget > 0 ? ($startedAtMs ?? $this->clockMs()) + $budget : null;
 
         try {
             $pending = [];
@@ -1277,10 +1324,12 @@ class Logger
      * The logger stays usable afterwards — a later log call buffers as normal
      * and is drained by the end-of-request hook — so this is safe to call on a
      * shutdown path that races with in-flight work, and safe to call twice.
+     * Until then the process-wide shutdown hook no longer visits it.
      */
     public function shutdown(): void
     {
         $this->flush();
+        self::$awaitingShutdown?->offsetUnset($this);
     }
 
     /** Alias for {@see Logger::shutdown()}. */
@@ -1650,45 +1699,150 @@ class Logger
     }
 
     /**
-     * Arms the end-of-request drain, once, on the first buffered entry.
+     * Puts this logger on the process-wide shutdown drain, registering that
+     * drain's one `register_shutdown_function` hook if it is not already
+     * pending. Called on every buffered entry; cheap when already queued.
      *
-     * Lazy rather than constructor-time so a logger that is never used does
-     * not pin itself in memory for the life of the request. The closure holds
-     * `$this`, which is what keeps the buffer alive until the hook runs.
+     * Lazy rather than constructor-time, so a logger that never buffers is
+     * never visited. The hook is a `static` closure and the queue is a
+     * `WeakMap`, so neither keeps a logger alive (FLT-1522).
      */
     private function armShutdownFlush(): void
     {
-        if ($this->shutdownArmed || !$this->flushOnShutdown) {
+        if (!$this->flushOnShutdown) {
             return;
         }
-        $this->shutdownArmed = true;
 
-        register_shutdown_function($this->drainOnShutdown(...));
+        self::$awaitingShutdown ??= new \WeakMap();
+        self::$awaitingShutdown[$this] = true;
+
+        if (self::$shutdownHookPending) {
+            return;
+        }
+        self::$shutdownHookPending = true;
+
+        $hook = static function (): void {
+            self::drainAllOnShutdown();
+        };
+        if (self::$registerShutdownHook !== null) {
+            (self::$registerShutdownHook)($hook);
+        } else {
+            register_shutdown_function($hook);
+        }
     }
 
-    /** The end-of-request drain. Registered by {@see self::armShutdownFlush()}. */
-    private function drainOnShutdown(): void
+    /**
+     * The process-wide end-of-request drain: every logger still alive with
+     * entries queued since its last `shutdown()`. Registered by
+     * {@see self::armShutdownFlush()}.
+     */
+    private static function drainAllOnShutdown(): void
     {
-        // Hand the response to the client BEFORE talking to ingest, so
-        // delivery costs the partner's request nothing. Returns false if
-        // the framework already called it (Symfony/Laravel do) — harmless.
-        if ($this->finishRequestOnShutdown && function_exists('fastcgi_finish_request')) {
-            fastcgi_finish_request();
+        // PHP runs shutdown functions in registration order, and this one is
+        // registered on the FIRST log call — so anything the application
+        // registered later runs after this drain. An entry logged from there
+        // (a fatal-error handler, a debug bar), or from a drain's own
+        // `onError`, would otherwise sit in the buffer until the process died,
+        // delivered by nothing and reported to no one. Clearing the flag (and
+        // the queue, below) lets that entry register a fresh hook: a function
+        // registered *during* shutdown still runs.
+        self::$shutdownHookPending = false;
+
+        // Copied first: a drain runs caller code (`onError`), and the list
+        // being visited must not change under it. These references are strong
+        // only for the length of this call.
+        $loggers = [];
+        foreach (self::$awaitingShutdown ?? [] as $logger => $_) {
+            $loggers[] = $logger;
+        }
+        self::$awaitingShutdown = null;
+
+        if ($loggers === []) {
+            return;
         }
 
-        // Belongs to no request (PAPI-5336, rule 4) — and an `exit` inside
-        // runWithContext() skips the `finally` that would have closed its
-        // scope, so the stack may still name one here.
-        $this->atRootScope(fn () => $this->flush());
+        // One budget for the whole drain: each logger's `drainDeadlineMs`
+        // counts from now, not from its turn, so N loggers still finish
+        // within the longest of their budgets — it is the FPM request's
+        // `request_terminate_timeout` they are all spending.
+        $startedAt = [];
+        foreach ($loggers as $i => $logger) {
+            try {
+                $startedAt[$i] = $logger->clockMs();
+            } catch (\Throwable) {
+                // A caller-supplied `clock` that throws; drain() reports it.
+                $startedAt[$i] = null;
+            }
+        }
 
-        // PHP runs shutdown functions in registration order, and this one is
-        // armed on the FIRST log call — so anything the application registered
-        // later runs after this drain. An entry logged from there (a
-        // fatal-error handler, a debug bar) would otherwise sit in the buffer
-        // until the process died, delivered by nothing and reported to no one.
-        // Disarming lets that entry arm a fresh hook: a function registered
-        // *during* shutdown still runs.
-        $this->shutdownArmed = false;
+        // Hand the response to the client BEFORE talking to ingest, so
+        // delivery costs the partner's request nothing — once, not per
+        // logger. If any logger asks for it the response ends here, so a
+        // logger that opted out is drained after it too.
+        foreach ($loggers as $logger) {
+            if ($logger->finishRequestOnShutdown) {
+                self::finishResponse();
+                break;
+            }
+        }
+
+        foreach ($loggers as $i => $logger) {
+            // Belongs to no request (PAPI-5336, rule 4) — and an `exit` inside
+            // runWithContext() skips the `finally` that would have closed its
+            // scope, so the stack may still name one here.
+            $logger->atRootScope(fn () => $logger->flushFrom($startedAt[$i]));
+        }
+    }
+
+    /**
+     * `fastcgi_finish_request()`, at most once per process. Returns false if
+     * the framework already called it (Symfony/Laravel do) — harmless.
+     */
+    private static function finishResponse(): void
+    {
+        if (self::$responseFinished) {
+            return;
+        }
+        self::$responseFinished = true;
+
+        if (self::$finishResponse !== null) {
+            (self::$finishResponse)();
+        } elseif (function_exists('fastcgi_finish_request')) {
+            fastcgi_finish_request();
+        }
+    }
+
+    /**
+     * @internal Test seam (FLT-1522). Replaces `register_shutdown_function()`
+     * and `fastcgi_finish_request()` for the shutdown drain, and forgets every
+     * queued logger and any pending hook, so a test can count registrations
+     * and run the hook itself. No arguments restores the real functions; a
+     * real hook already registered stays registered and finds nothing queued.
+     *
+     * @param (\Closure(callable): void)|null $register
+     * @param (\Closure(): void)|null $finishResponse
+     */
+    public static function overrideShutdownHook(?\Closure $register = null, ?\Closure $finishResponse = null): void
+    {
+        self::$registerShutdownHook = $register;
+        self::$finishResponse = $finishResponse;
+        self::$awaitingShutdown = null;
+        self::$shutdownHookPending = false;
+        self::$responseFinished = false;
+    }
+
+    /**
+     * A logger dropped with entries still buffered delivers them now, within
+     * `drainDeadlineMs`, rather than losing them: since 2.1.1 the shutdown
+     * hook no longer keeps it alive to do so at process exit (FLT-1522).
+     * Gated on `flushOnShutdown`, like the hook. A logger alive at shutdown
+     * is drained by the hook first, so this finds nothing to do.
+     */
+    public function __destruct()
+    {
+        if ($this->flushOnShutdown && $this->buffer !== []) {
+            $this->atRootScope(fn () => $this->flush());
+        }
     }
 
     /**
