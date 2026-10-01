@@ -27,11 +27,21 @@ long-lived worker. No API change.
   process-wide hook is now registered, on the first buffered entry, and holds
   loggers weakly. It still calls `fastcgi_finish_request()` before delivering
   anything (once, however many loggers it drains), honours `flushOnShutdown`
-  and `finishRequestOnShutdown`, and ends within `drainDeadlineMs` of starting
-  (every logger's budget counts from the hook's start, so several loggers no
-  longer get one each); `shutdown()` / `close()` take a logger off it until it
-  buffers again. A logger dropped with entries still buffered now drains them
-  as it is destroyed instead of at process exit.
+  and `finishRequestOnShutdown`, and ends within the longest `drainDeadlineMs`
+  of the loggers it drains (every logger's budget counts from the moment the
+  response is finished, so several loggers no longer get one each);
+  `shutdown()` / `close()` take a logger off it until it buffers again.
+- **Behaviour change: a logger dropped with entries still buffered drains as
+  it is destroyed, inside the request (FLT-1522).** 2.1.0 kept it alive and
+  delivered after `fastcgi_finish_request()` at process exit; with the hook
+  no longer holding it, that would have lost the entries silently. The drain
+  runs whenever the last reference goes (a function return, or the cycle
+  collector), so under PHP-FPM it can run before the response. It is bounded
+  like the `batchSize` drain: one attempt per batch, no backoff, at most
+  `autoDrainTimeoutMs` (default 1000 ms) in all. Whatever it could not deliver
+  is reported through `onError` (`flush-failed`, or `drain-timeout` for
+  batches the budget never reached) and dropped. Keep one logger for the
+  request rather than one per call.
 
 ## 2.1.0
 

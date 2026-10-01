@@ -401,9 +401,9 @@ construction.
 | `retryBaseDelayMs`        | 200                     | `RETRY_BASE_DELAY_MS`             | First backoff window; it doubles per retry, with jitter                                                           |
 | `retryMaxDelayMs`         | 5000                    | `RETRY_MAX_DELAY_MS`              | Largest backoff window                                                                                            |
 | `requestTimeoutMs`        | 5000                    | `REQUEST_TIMEOUT_MS`              | Deadline for one POST, metrics included; `0` disables it                                                          |
-| `autoDrainTimeoutMs`      | 1000                    | `AUTO_DRAIN_TIMEOUT_MS`           | Budget for the drain inside a log call; `0` disables it                                                           |
+| `autoDrainTimeoutMs`      | 1000                    | `AUTO_DRAIN_TIMEOUT_MS`           | Budget for the drain inside a log call, and as a logger is destroyed; `0` disables it                             |
 | `drainDeadlineMs`         | 5000                    | `DRAIN_DEADLINE_MS`               | Budget for one `flush()` or end-of-request drain, retries included; `0` disables it                               |
-| `flushOnShutdown`         | `true`                  | `FLUSH_ON_SHUTDOWN`               | Drain from a `register_shutdown_function`, and when a logger is destroyed with entries buffered                   |
+| `flushOnShutdown`         | `true`                  | `FLUSH_ON_SHUTDOWN`               | Drain from a `register_shutdown_function`, and (bounded by `autoDrainTimeoutMs`) when a logger is destroyed       |
 | `finishRequestOnShutdown` | `true`                  | `FINISH_REQUEST`                  | Call `fastcgi_finish_request()` before that drain                                                                 |
 
 `batchSize` is capped at `maxBufferSize` and at 1000. Under Laravel each
@@ -435,21 +435,29 @@ response:
   job, or from `Queue::after()` / `Queue::failing()`.
 
 The shutdown hook does not keep a logger alive. A logger dropped with entries
-still buffered drains them as it is destroyed, inside the request, so keep one
-logger for the request rather than one per call.
+still buffered drains them as it is destroyed, inside the request; see
+[What this costs your request](#what-this-costs-your-request).
 
 A POST carries at most 1000 entries
 and 1 MB of log lines.
 
 ### What this costs your request
 
-PHP has no event loop, so delivery is synchronous and bounded twice:
+PHP has no event loop, so delivery is synchronous and bounded:
 
 - **A log call** waits only for drain 1, for at most `autoDrainTimeoutMs`
   (1 s): one attempt per batch, no backoff, and anything undelivered goes back
   on the buffer. A failed drain switches drain 1 off until a later drain
   delivers everything, so an ingest outage costs a request one
   `autoDrainTimeoutMs` at most.
+- **A logger dropped mid-request** with entries still buffered (since 2.1.1)
+  delivers them as it is destroyed, whenever its last reference goes — on a
+  function return, or whenever the cycle collector runs. Under PHP-FPM that is
+  synchronous and before the response, so it costs what drain 1 costs: one
+  attempt per batch, no backoff, at most `autoDrainTimeoutMs` for the whole
+  drain. What it could not deliver is dropped and reported as `flush-failed`
+  or `drain-timeout`. That is once per dropped logger: keep one for the
+  request.
 - **`flush()` and the end-of-request drain** carry the retries and are bounded
   as a whole by `drainDeadlineMs` (5 s). Entries still undelivered then are
   dropped and reported as `drain-timeout`.

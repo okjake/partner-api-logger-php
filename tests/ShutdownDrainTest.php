@@ -160,6 +160,31 @@ final class ShutdownDrainTest extends TestCase
         $this->assertSame(['finish', 'post:a', 'post:b', 'post:a'], $this->events);
     }
 
+    /**
+     * The budget starts once the response is finished, so a slow
+     * `fastcgi_finish_request()` (a large response still being written out)
+     * does not eat the drain's `drainDeadlineMs` — as before 2.1.1.
+     */
+    public function testTheDrainBudgetStartsAfterTheResponseIsFinished(): void
+    {
+        Logger::overrideShutdownHook(
+            function (callable $hook): void {
+                $this->hooks[] = $hook;
+            },
+            function (): void {
+                $this->events[] = 'finish';
+                $this->now += 1000;
+            },
+        );
+        $logger = $this->logger('a', ['drainDeadlineMs' => 1000]);
+        $logger->info(self::KEY, 'one');
+
+        $this->runHooks();
+
+        $this->assertSame(['finish', 'post:a'], $this->events);
+        $this->assertSame([], $this->reported);
+    }
+
     public function testFinishRequestOnShutdownFalseLeavesTheResponseAlone(): void
     {
         $logger = $this->logger('a', ['finishRequestOnShutdown' => false]);
@@ -208,6 +233,72 @@ final class ShutdownDrainTest extends TestCase
         $this->runHooks();
 
         $this->assertSame(['post:gone'], $this->events, 'the hook finds nothing to visit');
+    }
+
+    /**
+     * The destroy-time drain can run mid-request — before the response, under
+     * PHP-FPM — so it may cost no more than the `batchSize` drain: one attempt
+     * per chunk, no backoff sleep, `autoDrainTimeoutMs` for the whole drain,
+     * never `drainDeadlineMs` with retries. Wall-clock on purpose: the double
+     * really hangs for the timeout the logger hands it, as a blackholed ingest
+     * would, and the logger runs on its real monotonic clock.
+     */
+    public function testADroppedLoggersDrainIsBoundedByTheAutoDrainTimeout(): void
+    {
+        $attempts = [];
+        $sleeps = [];
+        $logger = new Logger(
+            tenantToken: 'tenant-token',
+            baseUrl: 'https://ingest.test',
+            httpClient: new RecordingTransport(static function (string $method, string $url, array $request) use (&$attempts): Response {
+                $key = $request['headers']['x-api-key'];
+                $attempts[$key] = ($attempts[$key] ?? 0) + 1;
+                usleep((int) (((float) ($request['timeout'] ?? 0)) * 1e6));
+                throw new ConnectException('cURL error 28: Operation timed out', new Request('POST', $url));
+            }),
+            options: [
+                'batchSize' => 0,
+                'autoDrainTimeoutMs' => 200,
+                'drainDeadlineMs' => 5000,
+                'requestTimeoutMs' => 5000,
+                'maxRetries' => 3,
+                'onError' => function (LoggerErrorEvent $event): void {
+                    $this->reported[] = $event;
+                },
+                'sleeper' => static function (int $milliseconds) use (&$sleeps): void {
+                    $sleeps[] = $milliseconds;
+                },
+            ],
+        );
+        // Three API keys: three groups, so three chunks to post.
+        $logger->info('key-a', 'one');
+        $logger->info('key-b', 'two');
+        $logger->info('key-c', 'three');
+
+        $started = hrtime(true);
+        unset($logger);
+        gc_collect_cycles();
+        $elapsedMs = (hrtime(true) - $started) / 1e6;
+
+        $this->assertLessThan(200 + 150, $elapsedMs, 'bounded by autoDrainTimeoutMs, not drainDeadlineMs');
+        $this->assertSame([], $sleeps, 'no backoff');
+        $this->assertSame([1], array_values(array_unique($attempts)), 'never more than one attempt per chunk');
+
+        // The first chunk spends the budget (to within the clock's rounding,
+        // which can leave a 1 ms attempt for the next); whatever the budget
+        // never reached is a drain-timeout. Every entry is accounted for.
+        $dropped = 0;
+        foreach ($this->reported as $event) {
+            $this->assertContains($event->reason, [LoggerErrorEvent::REASON_FLUSH_FAILED, LoggerErrorEvent::REASON_DRAIN_TIMEOUT]);
+            if ($event->reason === LoggerErrorEvent::REASON_FLUSH_FAILED) {
+                $this->assertSame(1, $event->attempts);
+            } else {
+                $this->assertStringContainsString('(200 ms)', $event->message, 'names the budget that ran out');
+            }
+            $dropped += $event->entryCount;
+        }
+        $this->assertSame(3, $dropped, 'every undelivered entry reported as a drop');
+        $this->assertSame(LoggerErrorEvent::REASON_DRAIN_TIMEOUT, end($this->reported)->reason);
     }
 
     public function testADroppedLoggerWithFlushOnShutdownOffDeliversNothing(): void
