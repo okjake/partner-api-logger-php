@@ -25,41 +25,47 @@ use Ramsey\Uuid\Uuid;
  *    the first buffered entry. It calls `fastcgi_finish_request()` first where
  *    the SAPI provides it, so the client already has its response before a
  *    single byte goes to ingest, then drains every logger still holding
- *    entries. It holds loggers weakly (FLT-1522), so a logger dropped before
- *    shutdown is collected as usual — which is what (4) is for.
- * 4. Destruction (since 2.1.1). A logger dropped with entries still buffered
- *    delivers them as it is destroyed: whenever its last reference goes, on a
- *    function return or whenever the cycle collector happens to run. That can
- *    be mid-request, before the response, so it costs what (2) costs — see
- *    below — and drops, through `onError`, what it could not deliver.
+ *    entries. Under PHP-FPM and the other per-request SAPIs it holds those
+ *    loggers until it runs, exactly as 2.1.0 did. On a long-lived worker
+ *    (`cli`: Octane, RoadRunner, Swoole, `queue:work`) it holds them weakly
+ *    (FLT-1522), so a dropped logger is collected as usual — which is what
+ *    (4) is for.
+ * 4. Destruction, on a long-lived worker only (since 2.1.1). A logger dropped
+ *    with entries still buffered delivers them as it is destroyed: whenever
+ *    its last reference goes, on a function return or whenever the cycle
+ *    collector happens to run. That can be mid-request, so it costs what (2)
+ *    costs — see below — and drops, through `onError`, what it could not
+ *    deliver.
  *
  * A shutdown function fires once per PROCESS, so on a long-lived worker
- * (Octane, RoadRunner, a queue worker) (3) is not an end-of-request drain.
- * Under Laravel the service provider registers a `terminating` callback that
- * drains the logger the request used after every HTTP request — under Octane
- * that is the request sandbox's logger (FLT-1522). Nothing drains per queued
- * job: call `flush()` at the end of each job.
+ * (3) is not an end-of-request drain. Under Laravel the service provider
+ * registers a `terminating` callback that drains the logger the request used
+ * after every HTTP request — under Octane that is the request sandbox's
+ * logger (FLT-1522). Nothing drains per queued job: call `flush()` at the end
+ * of each job. A child forked with `pcntl_fork()` inherits the pending hook
+ * and the parent's buffer, so it delivers the parent's buffered entries again
+ * at its own exit (2.1.0 did too): `flush()` before forking.
  *
  * **What a caller can be made to wait for.** Only (2) runs inside a log call,
- * and (4) may run anywhere in the request. Both are deliberately cheap: one
- * attempt per batch, the drain *as a whole*
- * bounded by `autoDrainTimeoutMs` (default 1000 ms), no backoff sleep, and any
- * chunk it could not deliver — refused for a retryable reason, or never
- * reached before the budget ran out — goes back on the buffer rather than
- * being retried on the request path. A failed auto-drain then latches off for
- * the rest of the request, so N log calls cannot cost N timeouts. So a single
- * log call blocks for at most `autoDrainTimeoutMs`, and a whole request for at
- * most that once. The budget has to cover the whole drain and not just one
- * attempt: a drain posts one request per (apiKey, labels, upstream) group, so
- * a per-attempt bound would still let a request that logged at four levels
- * pay four timeouts inside a single `info()`.
+ * and only (4) can run anywhere else in a request. Both are deliberately
+ * cheap: one attempt per batch, the drain *as a whole* bounded by
+ * `autoDrainTimeoutMs` (default 1000 ms), no backoff sleep. Any chunk (2)
+ * could not deliver — refused for a retryable reason, or never reached before
+ * the budget ran out — goes back on the buffer rather than being retried on
+ * the request path, and a failed (2) then latches off for the rest of the
+ * request, so N log calls cannot cost N timeouts: a single log call blocks
+ * for at most `autoDrainTimeoutMs`, and a whole request for at most that
+ * once. The budget has to cover the whole drain and not just one attempt: a
+ * drain posts one request per (apiKey, labels, upstream) group, so a
+ * per-attempt bound would still let a request that logged at four levels pay
+ * four timeouts inside a single `info()`.
  *
- * (4) has no later drain to hand anything to: under PHP-FPM it delivers
- * synchronously, before the response, one attempt per batch within one
- * `autoDrainTimeoutMs`, and reports what it could not deliver as
- * `flush-failed` (attempted) or `drain-timeout` (never reached) and drops it.
- * Each logger dropped with a buffer can cost its request that much once; keep
- * one logger for the request rather than one per call.
+ * (4) has no later drain to hand anything to: it delivers synchronously, one
+ * attempt per batch within one `autoDrainTimeoutMs`, and reports what it
+ * could not deliver as `flush-failed` (attempted) or `drain-timeout` (never
+ * reached) and drops it. Each logger dropped with a buffer can cost its
+ * request that much once; keep one logger for the request rather than one
+ * per call.
  *
  * (1) and (3) carry the retries, and are bounded as a whole by
  * `drainDeadlineMs` (default 5000 ms). That matters most for (3): it runs
@@ -286,7 +292,7 @@ class Logger
 
     /**
      * Loggers holding entries the process-wide shutdown drain must deliver
-     * (FLT-1522). The keys are weak, so being in here never keeps a logger
+     * (FLT-1522). The keys are weak, so this map alone never keeps a logger
      * alive: a per-request logger on a long-lived worker (an un-warmed
      * Octane sandbox's) is collected like any other object and drops out.
      * Until 2.1.1 each logger registered its own shutdown function, a closure
@@ -299,8 +305,36 @@ class Logger
      */
     private static ?\WeakMap $awaitingShutdown = null;
 
+    /**
+     * The same loggers, held STRONGLY, on a per-request SAPI only (see
+     * {@see self::PER_REQUEST_SAPIS}). There every static is reset when the
+     * request ends, so nothing can leak, and holding the logger to the hook
+     * keeps 2.1.0's behaviour exactly: delivery after
+     * `fastcgi_finish_request()`, never a destroy-time drain inside the
+     * request. Keyed by `spl_object_id()`.
+     *
+     * @var array<int, Logger>
+     */
+    private static array $heldUntilShutdown = [];
+
+    /**
+     * SAPIs that run one request per PHP request lifecycle (statics and
+     * shutdown functions reset when it ends): PHP-FPM, FastCGI, CGI, mod_php,
+     * LiteSpeed and the built-in server (`artisan serve`). Anything else —
+     * `cli` (Octane on Swoole or RoadRunner, `queue:work`, scripts),
+     * `phpdbg`, `frankenphp` (whose worker mode keeps the process across
+     * requests) — is treated as long-lived.
+     */
+    private const PER_REQUEST_SAPIS = ['fpm-fcgi', 'cgi-fcgi', 'cgi', 'apache2handler', 'litespeed', 'cli-server'];
+
     /** Whether the one shutdown hook is registered and has not run yet. */
     private static bool $shutdownHookPending = false;
+
+    /** Whether that hook is running now; see drainAllOnShutdown(). */
+    private static bool $shutdownHookRunning = false;
+
+    /** PHP_SAPI unless a test says otherwise; see overrideShutdownHook(). */
+    private static ?string $sapi = null;
 
     /** Set once the hook has finished the response, so it never does twice. */
     private static bool $responseFinished = false;
@@ -352,14 +386,16 @@ class Logger
      *   Guzzle has no timeout by default, so without this a blackholed ingest
      *   hangs the flush — and in direct mode, the request itself.
      * - `autoDrainTimeoutMs` — total wall-clock budget for the `batchSize`
-     *   drain, which is the only drain a caller waits on (default 1000; `0`
+     *   drain, the only drain a log call waits on (default 1000; `0`
      *   disables the bound). This is the SDK's whole budget for one log call,
      *   across every group and chunk: one attempt each, no backoff sleep, and
      *   anything it could not deliver in time goes back on the buffer for the
      *   end-of-request drain rather than being retried on the request path.
      *   Also the budget for the drain a logger runs as it is destroyed with
-     *   entries still buffered, which can run mid-request too (FLT-1522); that
-     *   one drops what it could not deliver, as nothing drains after it.
+     *   entries still buffered on a long-lived worker, which can run
+     *   mid-request too (FLT-1522); that one drops what it could not deliver,
+     *   as nothing drains after it. With `0` that drain bounds each attempt
+     *   by `requestTimeoutMs` instead.
      * - `drainDeadlineMs` — total wall-clock budget for one `flush()` /
      *   `shutdown()` / end-of-request drain, across every group, chunk, retry
      *   and backoff (default 5000; `0` disables the bound). Whatever is still
@@ -368,9 +404,9 @@ class Logger
      *   `fastcgi_finish_request()` — keep it well under the pool's
      *   `request_terminate_timeout`, or FPM kills the worker mid-drain.
      * - `flushOnShutdown` — drain from the process-wide
-     *   `register_shutdown_function` hook, and — one attempt per batch,
-     *   within `autoDrainTimeoutMs` — when the logger is destroyed with
-     *   entries still buffered (default true).
+     *   `register_shutdown_function` hook, and, on a long-lived worker, when
+     *   the logger is destroyed with entries still buffered (one attempt per
+     *   batch, within `autoDrainTimeoutMs`) (default true).
      * - `finishRequestOnShutdown` — call `fastcgi_finish_request()` before that
      *   drain where the SAPI has it (default true), so delivery happens after
      *   the client already has its response.
@@ -1199,9 +1235,19 @@ class Logger
         // only the attempt leaves the log call costing groups × the timeout —
         // 4 s for a request that logged at four levels. `0` disables.
         $budget = $profile === self::DRAIN_FULL ? $this->drainDeadlineMs : $this->autoDrainTimeoutMs;
-        $deadline = $budget > 0 ? ($startedAtMs ?? $this->clockMs()) + $budget : null;
+
+        // Read in the catch below, which accounts for every entry of `$batch`
+        // the drain had not settled when something threw.
+        $deliveredBefore = $this->deliveredTotal;
+        $droppedBefore = $this->droppedTotal;
+        $requeue = [];
+        $rebuffered = 0;
 
         try {
+            // Inside the try: a caller-supplied `clock` that throws must not
+            // escape a log call, flush(), the shutdown hook or a destructor.
+            $deadline = $budget > 0 ? ($startedAtMs ?? $this->clockMs()) + $budget : null;
+
             $pending = [];
             foreach ($this->group($batch) as $group) {
                 foreach ($this->chunk($group) as $chunk) {
@@ -1209,7 +1255,6 @@ class Logger
                 }
             }
 
-            $requeue = [];
             $delivered = true;
 
             while ($pending !== []) {
@@ -1256,7 +1301,9 @@ class Logger
             }
 
             if ($requeue !== []) {
+                $rebuffered = count($requeue);
                 $this->rebuffer($requeue);
+                $requeue = [];
             }
 
             if ($profile === self::DRAIN_AUTO && !$delivered) {
@@ -1270,13 +1317,25 @@ class Logger
             // Belt and braces. `postBatch()` already swallows every delivery
             // failure, so reaching here means something outside that contract
             // threw — a caller-supplied `sleeper` or `clock`, most plausibly.
-            // This runs from a shutdown function and from the log path, and an
-            // exception escaping either is precisely the failure this SDK
-            // exists to keep away from the partner's request.
+            // This runs from a shutdown function, a destructor and the log
+            // path, and an exception escaping any of them is precisely the
+            // failure this SDK exists to keep away from the partner's request.
+            //
+            // Every entry of the batch not yet delivered, dropped (and
+            // reported) or put back on the buffer is lost here; count it.
+            if ($requeue !== []) {
+                $rebuffered += count($requeue);
+                $this->rebuffer($requeue);
+            }
+            $lost = max(0, count($batch)
+                - ($this->deliveredTotal - $deliveredBefore)
+                - ($this->droppedTotal - $droppedBefore)
+                - $rebuffered);
+            $this->droppedTotal += $lost;
             $this->report(new LoggerErrorEvent(
                 LoggerErrorEvent::REASON_FLUSH_FAILED,
                 'Failed to send log: flush abandoned: ' . $e->getMessage(),
-                0,
+                $lost,
                 $this->droppedTotal,
                 null,
                 null,
@@ -1354,6 +1413,7 @@ class Logger
     {
         $this->flush();
         self::$awaitingShutdown?->offsetUnset($this);
+        unset(self::$heldUntilShutdown[spl_object_id($this)]);
     }
 
     /** Alias for {@see Logger::shutdown()}. */
@@ -1729,7 +1789,8 @@ class Logger
      *
      * Lazy rather than constructor-time, so a logger that never buffers is
      * never visited. The hook is a `static` closure and the queue is a
-     * `WeakMap`, so neither keeps a logger alive (FLT-1522).
+     * `WeakMap`, so on a long-lived worker neither keeps a logger alive
+     * (FLT-1522); on a per-request SAPI the queue also holds it strongly.
      */
     private function armShutdownFlush(): void
     {
@@ -1739,8 +1800,18 @@ class Logger
 
         self::$awaitingShutdown ??= new \WeakMap();
         self::$awaitingShutdown[$this] = true;
+        if (!self::holdsLoggersWeakly()) {
+            self::$heldUntilShutdown[spl_object_id($this)] = $this;
+        }
 
-        if (self::$shutdownHookPending) {
+        // An entry buffered WHILE the hook drains — from a drain's own
+        // `onError`, typically, which can log on the very logger whose
+        // delivery just failed — is queued but registers nothing: with ingest
+        // down, a fresh hook per round would fail, log, and register again
+        // forever, and the process would never exit. 2.1.0 behaved the same
+        // way. A later entry (from a shutdown function registered after this
+        // one, say) registers a fresh hook, which drains it and those.
+        if (self::$shutdownHookPending || self::$shutdownHookRunning) {
             return;
         }
         self::$shutdownHookPending = true;
@@ -1756,6 +1827,16 @@ class Logger
     }
 
     /**
+     * Whether the shutdown queue holds loggers weakly and a dropped logger
+     * drains as it is destroyed: true everywhere but a per-request SAPI. The
+     * one place that decision is made.
+     */
+    private static function holdsLoggersWeakly(): bool
+    {
+        return !in_array(self::$sapi ?? PHP_SAPI, self::PER_REQUEST_SAPIS, true);
+    }
+
+    /**
      * The process-wide end-of-request drain: every logger still alive with
      * entries queued since its last `shutdown()`. Registered by
      * {@see self::armShutdownFlush()}.
@@ -1765,57 +1846,65 @@ class Logger
         // PHP runs shutdown functions in registration order, and this one is
         // registered on the FIRST log call — so anything the application
         // registered later runs after this drain. An entry logged from there
-        // (a fatal-error handler, a debug bar), or from a drain's own
-        // `onError`, would otherwise sit in the buffer until the process died,
-        // delivered by nothing and reported to no one. Clearing the flag (and
-        // the queue, below) lets that entry register a fresh hook: a function
-        // registered *during* shutdown still runs.
+        // (a fatal-error handler, a debug bar) would otherwise sit in the
+        // buffer until the process died, delivered by nothing and reported to
+        // no one. Clearing the flag lets that entry register a fresh hook: a
+        // function registered *during* shutdown still runs. Entries logged
+        // while this one runs do not (see armShutdownFlush()).
         self::$shutdownHookPending = false;
+        self::$shutdownHookRunning = true;
 
-        // Copied first: a drain runs caller code (`onError`), and the list
-        // being visited must not change under it. These references are strong
-        // only for the length of this call.
-        $loggers = [];
-        foreach (self::$awaitingShutdown ?? [] as $logger => $_) {
-            $loggers[] = $logger;
-        }
-        self::$awaitingShutdown = null;
-
-        if ($loggers === []) {
-            return;
-        }
-
-        // Hand the response to the client BEFORE talking to ingest, so
-        // delivery costs the partner's request nothing — once, not per
-        // logger. If any logger asks for it the response ends here, so a
-        // logger that opted out is drained after it too.
-        foreach ($loggers as $logger) {
-            if ($logger->finishRequestOnShutdown) {
-                self::finishResponse();
-                break;
+        try {
+            // Copied first: a drain runs caller code (`onError`), and the
+            // list being visited must not change under it. These references
+            // are strong only for the length of this call.
+            $loggers = [];
+            foreach (self::$awaitingShutdown ?? [] as $logger => $_) {
+                $loggers[] = $logger;
             }
-        }
+            self::$awaitingShutdown = null;
+            self::$heldUntilShutdown = [];
 
-        // One budget for the whole drain: each logger's `drainDeadlineMs`
-        // counts from here — after the response is finished, as for a single
-        // logger before 2.1.1 — not from its own turn, so N loggers still
-        // finish within the longest of their budgets: it is the FPM request's
-        // `request_terminate_timeout` they are all spending.
-        $startedAt = [];
-        foreach ($loggers as $i => $logger) {
-            try {
-                $startedAt[$i] = $logger->clockMs();
-            } catch (\Throwable) {
-                // A caller-supplied `clock` that throws; drain() reports it.
-                $startedAt[$i] = null;
+            if ($loggers === []) {
+                return;
             }
-        }
 
-        foreach ($loggers as $i => $logger) {
-            // Belongs to no request (PAPI-5336, rule 4) — and an `exit` inside
-            // runWithContext() skips the `finally` that would have closed its
-            // scope, so the stack may still name one here.
-            $logger->atRootScope(fn () => $logger->flushFrom($startedAt[$i]));
+            // Hand the response to the client BEFORE talking to ingest, so
+            // delivery costs the partner's request nothing — once, not per
+            // logger. If any logger asks for it the response ends here, so a
+            // logger that opted out is drained after it too.
+            foreach ($loggers as $logger) {
+                if ($logger->finishRequestOnShutdown) {
+                    self::finishResponse();
+                    break;
+                }
+            }
+
+            // One budget for the whole drain: each logger's `drainDeadlineMs`
+            // counts from here — after the response is finished, as for a
+            // single logger before 2.1.1 — not from its own turn, so N
+            // loggers still finish within the longest of their budgets: it is
+            // the FPM request's `request_terminate_timeout` they all spend.
+            $startedAt = [];
+            foreach ($loggers as $i => $logger) {
+                try {
+                    $startedAt[$i] = $logger->clockMs();
+                } catch (\Throwable) {
+                    // A caller-supplied `clock` that throws. drain() reads it
+                    // again, inside its own try, and reports the loss there.
+                    $startedAt[$i] = null;
+                }
+            }
+
+            foreach ($loggers as $i => $logger) {
+                // Belongs to no request (PAPI-5336, rule 4) — and an `exit`
+                // inside runWithContext() skips the `finally` that would have
+                // closed its scope, so the stack may still name one here.
+                // flushFrom() never throws, so one logger cannot stop the next.
+                $logger->atRootScope(fn () => $logger->flushFrom($startedAt[$i]));
+            }
+        } finally {
+            self::$shutdownHookRunning = false;
         }
     }
 
@@ -1840,54 +1929,74 @@ class Logger
     /**
      * Test seam (FLT-1522); not part of the public API, and may change in any
      * release. Replaces `register_shutdown_function()` and
-     * `fastcgi_finish_request()` for the shutdown drain, and forgets every
-     * queued logger and any pending hook, so a test can count registrations
-     * and run the hook itself. No arguments restores the real functions; a
-     * real hook already registered stays registered and finds nothing queued.
+     * `fastcgi_finish_request()` for the shutdown drain, overrides the SAPI
+     * name that decides between weak and strong holding (see
+     * {@see self::PER_REQUEST_SAPIS}), and forgets every queued logger and
+     * any pending hook, so a test can count registrations and run the hook
+     * itself. No arguments restores the real ones; a real hook already
+     * registered stays registered and finds nothing queued.
      *
      * @internal
      *
      * @param (\Closure(callable): void)|null $register
      * @param (\Closure(): void)|null $finishResponse
      */
-    public static function overrideShutdownHook(?\Closure $register = null, ?\Closure $finishResponse = null): void
-    {
+    public static function overrideShutdownHook(
+        ?\Closure $register = null,
+        ?\Closure $finishResponse = null,
+        ?string $sapi = null,
+    ): void {
         self::$registerShutdownHook = $register;
         self::$finishResponse = $finishResponse;
+        self::$sapi = $sapi;
         self::$awaitingShutdown = null;
+        self::$heldUntilShutdown = [];
         self::$shutdownHookPending = false;
+        self::$shutdownHookRunning = false;
         self::$responseFinished = false;
     }
 
     /**
-     * A logger dropped with entries still buffered tries to deliver them now
-     * rather than losing them silently: since 2.1.1 the shutdown hook no
-     * longer keeps it alive to do so at process exit (FLT-1522). Gated on
-     * `flushOnShutdown`, like the hook. A logger alive at shutdown is drained
-     * by the hook first, so this finds nothing to do.
+     * On a long-lived worker, a logger dropped with entries still buffered
+     * tries to deliver them now rather than losing them silently: since 2.1.1
+     * the shutdown hook no longer keeps it alive to do so at process exit
+     * (FLT-1522). Gated on `flushOnShutdown`, like the hook. A logger alive
+     * at shutdown is drained by the hook first, so this finds nothing to do.
+     * On a per-request SAPI the hook still holds the logger, as in 2.1.0, so
+     * this does nothing there.
      *
      * This runs whenever the last reference goes — on a function return, or
-     * whenever the cycle collector runs — so it may be mid-request, before
-     * the response. It therefore costs what the `batchSize` drain costs (the
-     * `FINAL` profile): one attempt per chunk, no backoff sleep, bounded as a
-     * whole by `autoDrainTimeoutMs`. What it could not deliver is reported
-     * through `onError` (`flush-failed`, or `drain-timeout` for chunks the
-     * budget never reached) and dropped. Never throws.
+     * whenever the cycle collector runs — so it may be mid-request. It
+     * therefore costs what the `batchSize` drain costs (the `FINAL` profile):
+     * one attempt per chunk, no backoff sleep, bounded as a whole by
+     * `autoDrainTimeoutMs`. What it could not deliver is reported through
+     * `onError` (`flush-failed`, or `drain-timeout` for chunks the budget
+     * never reached) and dropped.
+     *
+     * Never throws, including on an object whose constructor never ran (a
+     * PHPUnit `createMock(Logger::class)`, a subclass that skips
+     * `parent::__construct()`): `$buffer` is read first because it is the one
+     * property with a default.
      */
     public function __destruct()
     {
-        if (!$this->flushOnShutdown || $this->buffer === []) {
-            return;
-        }
-
-        $this->atRootScope(function (): void {
-            try {
-                $this->reportUnreportedUpstreamLost();
-            } catch (\Throwable) {
-                // A caller-supplied `clock` that throws; drain() reports it.
+        try {
+            if ($this->buffer === [] || !$this->flushOnShutdown || !self::holdsLoggersWeakly()) {
+                return;
             }
-            $this->drain(self::DRAIN_FINAL);
-        });
+
+            $this->atRootScope(function (): void {
+                try {
+                    $this->reportUnreportedUpstreamLost();
+                } catch (\Throwable) {
+                    // A caller-supplied `clock` that throws. drain() reads it
+                    // again, inside its own try, and reports the loss there.
+                }
+                $this->drain(self::DRAIN_FINAL);
+            });
+        } catch (\Throwable) {
+            // Nothing may escape into whoever dropped the last reference.
+        }
     }
 
     /**
@@ -2054,9 +2163,14 @@ class Logger
     {
         // An AUTO drain's own budget is the ceiling for the whole drain, so a
         // single attempt can never be allowed more than what is left of it.
-        $ceiling = $profile === self::DRAIN_AUTO || $profile === self::DRAIN_FINAL
-            ? $this->autoDrainTimeoutMs
-            : $this->requestTimeoutMs;
+        // A FINAL drain with `autoDrainTimeoutMs: 0` (bound disabled) falls
+        // back to `requestTimeoutMs` per attempt, rather than to no timeout at
+        // all against a blackholed ingest.
+        $ceiling = match (true) {
+            $profile === self::DRAIN_AUTO => $this->autoDrainTimeoutMs,
+            $profile === self::DRAIN_FINAL && $this->autoDrainTimeoutMs > 0 => $this->autoDrainTimeoutMs,
+            default => $this->requestTimeoutMs,
+        };
 
         if ($deadline === null) {
             return $ceiling;

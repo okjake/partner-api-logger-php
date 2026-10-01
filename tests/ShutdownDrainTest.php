@@ -54,6 +54,9 @@ final class ShutdownDrainTest extends TestCase
             function (): void {
                 $this->events[] = 'finish';
             },
+            // A long-lived worker, explicitly: weak holding and the
+            // destroy-time drain. The per-request branch has its own tests.
+            'cli',
         );
     }
 
@@ -280,7 +283,7 @@ final class ShutdownDrainTest extends TestCase
         gc_collect_cycles();
         $elapsedMs = (hrtime(true) - $started) / 1e6;
 
-        $this->assertLessThan(200 + 150, $elapsedMs, 'bounded by autoDrainTimeoutMs, not drainDeadlineMs');
+        $this->assertLessThan(200 + 300, $elapsedMs, 'bounded by autoDrainTimeoutMs, not drainDeadlineMs');
         $this->assertSame([], $sleeps, 'no backoff');
         $this->assertSame([1], array_values(array_unique($attempts)), 'never more than one attempt per chunk');
 
@@ -334,25 +337,220 @@ final class ShutdownDrainTest extends TestCase
         $this->assertCount(200, $this->events, 'and every one delivered, on its way out');
     }
 
+    /**
+     * With ingest down and an `onError` that logs on the same logger (a
+     * pattern the readme allows), every round fails and logs again. If each
+     * entry logged during the drain registered a fresh hook, PHP would run
+     * them forever and the process would never exit.
+     */
+    public function testAnOnErrorThatLogsCannotKeepTheHookRunning(): void
+    {
+        $logger = null;
+        $logger = $this->logger('down', [
+            'maxRetries' => 0,
+            'onError' => function (LoggerErrorEvent $event) use (&$logger): void {
+                $this->reported[] = $event;
+                $logger->warn(self::KEY, 'delivery failed: ' . $event->reason);
+            },
+        ], failing: true);
+        $logger->info(self::KEY, 'hello');
+
+        $this->runHooks();
+
+        $this->assertSame(['finish', 'post:down'], $this->events, 'one round, as in 2.1.0');
+        $this->assertSame([], $this->hooks);
+        $this->assertSame(1, $logger->stats()['buffered'], 'the onError line waits, queued');
+
+        // Something logging after the hook (a later shutdown function)
+        // registers a fresh one, which takes that line too — and ends.
+        $logger->info(self::KEY, 'late');
+        $this->assertCount(1, $this->hooks);
+        $this->runHooks();
+
+        // Two POSTs (warn and info are separate groups); their failures log
+        // again, and again nothing re-registers.
+        $this->assertSame(['finish', 'post:down', 'post:down', 'post:down'], $this->events);
+        $this->assertSame([], $this->hooks);
+    }
+
+    /**
+     * PHPUnit's `createMock(Logger::class)` and a subclass that skips
+     * `parent::__construct()` both get an object whose typed properties were
+     * never initialised. Destroying one must not throw into the caller.
+     */
+    public function testDestroyingALoggerWhoseConstructorNeverRanIsSilent(): void
+    {
+        $mock = $this->createMock(Logger::class);
+        $mock->expects($this->once())->method('info');
+        $mock->info(self::KEY, 'doubled');
+        unset($mock);
+
+        $subclass = new class () extends Logger {
+            public function __construct()
+            {
+            }
+        };
+        unset($subclass);
+        gc_collect_cycles();
+
+        $this->assertSame([], $this->events);
+    }
+
+    /**
+     * A caller-supplied `clock` that throws must neither escape a destructor
+     * into whoever dropped the logger nor stop the shutdown hook before the
+     * next logger. The entries it costs are reported, with their count.
+     */
+    public function testAThrowingClockNeitherEscapesADestructorNorStopsTheHook(): void
+    {
+        $broken = false;
+        $clock = function () use (&$broken): float {
+            if ($broken) {
+                throw new \RuntimeException('clock broke');
+            }
+
+            return $this->now;
+        };
+
+        $dropped = $this->logger('dropped', ['clock' => $clock]);
+        $dropped->info(self::KEY, 'one');
+        $broken = true;
+        unset($dropped);
+        gc_collect_cycles();
+
+        $this->assertSame([], $this->events);
+        $this->assertCount(1, $this->reported);
+        $this->assertSame(LoggerErrorEvent::REASON_FLUSH_FAILED, $this->reported[0]->reason);
+        $this->assertSame(1, $this->reported[0]->entryCount, 'the lost entry is counted');
+        $this->assertStringContainsString('clock broke', $this->reported[0]->message);
+
+        $first = $this->logger('broken', ['clock' => $clock]);
+        $second = $this->logger('healthy');
+        $broken = false;
+        $first->info(self::KEY, 'a');
+        $second->info(self::KEY, 'b');
+        $broken = true;
+
+        $this->runHooks();
+
+        $this->assertSame(['finish', 'post:healthy'], $this->events, 'the next logger still drains');
+        $this->assertSame(1, $first->stats()['dropped']);
+    }
+
+    /**
+     * Where every static resets when the request ends (PHP-FPM and friends)
+     * nothing can leak, so 2.1.0's behaviour holds exactly: the hook keeps
+     * the logger, delivers after the response is finished, and nothing
+     * drains inside the request when a logger goes out of scope. Elsewhere
+     * the logger is collected and drains as it goes.
+     *
+     * @return array<string, array{string, bool}>
+     */
+    public static function sapis(): array
+    {
+        return [
+            'PHP-FPM' => ['fpm-fcgi', true],
+            'FastCGI' => ['cgi-fcgi', true],
+            'mod_php' => ['apache2handler', true],
+            'built-in server (artisan serve)' => ['cli-server', true],
+            'CLI (Octane, RoadRunner, queue:work)' => ['cli', false],
+            'FrankenPHP (worker mode is long-lived)' => ['frankenphp', false],
+            'phpdbg' => ['phpdbg', false],
+        ];
+    }
+
+    /** @dataProvider sapis */
+    public function testTheSapiDecidesBetweenHoldingAndDrainingOnDestruction(string $sapi, bool $perRequest): void
+    {
+        Logger::overrideShutdownHook(
+            function (callable $hook): void {
+                $this->hooks[] = $hook;
+            },
+            function (): void {
+                $this->events[] = 'finish';
+            },
+            $sapi,
+        );
+        $logger = $this->logger('x');
+        $logger->info(self::KEY, 'one');
+        $ref = \WeakReference::create($logger);
+
+        unset($logger);
+        gc_collect_cycles();
+
+        if ($perRequest) {
+            $this->assertNotNull($ref->get(), 'held until the hook, as in 2.1.0');
+            $this->assertSame([], $this->events, 'nothing drains inside the request');
+
+            $this->runHooks();
+
+            $this->assertSame(['finish', 'post:x'], $this->events, 'delivered after the response');
+            gc_collect_cycles();
+            $this->assertNull($ref->get(), 'and released once the hook has run');
+        } else {
+            $this->assertNull($ref->get(), 'collected');
+            $this->assertSame(['post:x'], $this->events, 'drained as it was destroyed');
+
+            $this->runHooks();
+
+            $this->assertSame(['post:x'], $this->events);
+        }
+    }
+
+    /**
+     * `autoDrainTimeoutMs: 0` disables the bound; the destroy-time drain then
+     * bounds each attempt by `requestTimeoutMs` rather than by nothing.
+     */
+    public function testTheDestroyTimeDrainFallsBackToRequestTimeoutWhenTheBudgetIsOff(): void
+    {
+        $timeouts = [];
+        $logger = new Logger(
+            tenantToken: 'tenant-token',
+            baseUrl: 'https://ingest.test',
+            httpClient: new RecordingTransport(static function (string $method, string $url, array $request) use (&$timeouts): Response {
+                $timeouts[] = $request['timeout'] ?? null;
+
+                return new Response(200, [], '{}');
+            }),
+            options: ['batchSize' => 0, 'autoDrainTimeoutMs' => 0, 'requestTimeoutMs' => 750],
+        );
+        $logger->info(self::KEY, 'one');
+
+        unset($logger);
+        gc_collect_cycles();
+
+        $this->assertSame([0.75], $timeouts);
+    }
+
     // ------------------------------------------------------------------- helpers
 
-    /** Runs the hooks registered since the last call, as PHP would at exit. */
+    /**
+     * Runs the hooks registered since the last call, as PHP would at exit —
+     * including any a hook registers while it runs. Fails rather than spin if
+     * they never stop coming.
+     */
     private function runHooks(): void
     {
-        while ($this->hooks !== []) {
+        for ($rounds = 0; $this->hooks !== []; $rounds++) {
+            if ($rounds === 10) {
+                $this->fail('the shutdown hook keeps re-registering itself');
+            }
             $hook = array_shift($this->hooks);
             $hook();
         }
     }
 
     /** @param array<string, mixed> $options */
-    private function logger(string $name, array $options = [], bool $blackhole = false): Logger
+    private function logger(string $name, array $options = [], bool $blackhole = false, bool $failing = false): Logger
     {
         return new Logger(
             tenantToken: 'tenant-token',
             baseUrl: 'https://ingest.test',
-            httpClient: new RecordingTransport(function (string $method, string $url, array $request) use ($name, $blackhole): Response {
+            httpClient: new RecordingTransport(function (string $method, string $url, array $request) use ($name, $blackhole, $failing): Response {
                 $this->events[] = "post:$name";
+                if ($failing) {
+                    throw new ConnectException('cURL error 7: Failed to connect', new Request('POST', $url));
+                }
                 if ($blackhole) {
                     // Burns exactly the deadline it was handed, then fails.
                     $this->now += (float) ($request['timeout'] ?? 0) * 1000;

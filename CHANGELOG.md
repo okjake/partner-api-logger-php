@@ -24,24 +24,36 @@ long-lived worker. No API change.
   with a closure over itself, so on Octane, RoadRunner or a queue worker every
   per-request logger — buffer, Guzzle client and options — stayed reachable
   until the process ended, and memory grew until `--max-requests`. One
-  process-wide hook is now registered, on the first buffered entry, and holds
-  loggers weakly. It still calls `fastcgi_finish_request()` before delivering
+  process-wide hook is now registered, on the first buffered entry. On a
+  long-running worker (the `cli` SAPI, and any SAPI not listed next) it holds
+  loggers weakly; under PHP-FPM, FastCGI, CGI, mod_php, LiteSpeed and the
+  built-in server, where nothing outlives the request, it holds them until it
+  runs, exactly as 2.1.0 did. It still calls `fastcgi_finish_request()` before delivering
   anything (once, however many loggers it drains), honours `flushOnShutdown`
   and `finishRequestOnShutdown`, and ends within the longest `drainDeadlineMs`
   of the loggers it drains (every logger's budget counts from the moment the
   response is finished, so several loggers no longer get one each);
-  `shutdown()` / `close()` take a logger off it until it buffers again.
-- **Behaviour change: a logger dropped with entries still buffered drains as
-  it is destroyed, inside the request (FLT-1522).** 2.1.0 kept it alive and
-  delivered after `fastcgi_finish_request()` at process exit; with the hook
-  no longer holding it, that would have lost the entries silently. The drain
-  runs whenever the last reference goes (a function return, or the cycle
-  collector), so under PHP-FPM it can run before the response. It is bounded
-  like the `batchSize` drain: one attempt per batch, no backoff, at most
-  `autoDrainTimeoutMs` (default 1000 ms) in all. Whatever it could not deliver
-  is reported through `onError` (`flush-failed`, or `drain-timeout` for
-  batches the budget never reached) and dropped. Keep one logger for the
-  request rather than one per call.
+  `shutdown()` / `close()` take a logger off it until it buffers again. An
+  entry logged while the hook is draining (from `onError`, say) waits for the
+  next drain rather than registering another hook, as in 2.1.0, so an
+  `onError` that logs while ingest is down cannot keep the process from
+  exiting.
+- **A caller-supplied `clock` that throws no longer escapes `flush()`, a log
+  call or the shutdown hook.** It is reported as `flush-failed` with the
+  number of entries lost, and the hook goes on to the next logger.
+- **Behaviour change on long-running workers only: a logger dropped with
+  entries still buffered drains as it is destroyed (FLT-1522).** 2.1.0 kept
+  it alive until the worker exited; with the hook no longer holding it, that
+  would have lost the entries silently. The drain runs whenever the last
+  reference goes (a function return, or the cycle collector), so it can run
+  mid-request. It is bounded like the `batchSize` drain: one attempt per
+  batch, no backoff, at most `autoDrainTimeoutMs` (default 1000 ms) in all,
+  or `requestTimeoutMs` per attempt when that is `0`. Whatever it could not
+  deliver is reported through `onError` (`flush-failed`, or `drain-timeout`
+  for batches the budget never reached) and dropped. Keep one logger for the
+  request rather than one per call. PHP-FPM and the other per-request SAPIs
+  are unchanged. Destroying a logger whose constructor never ran (a PHPUnit
+  `createMock(Logger::class)`) does nothing.
 
 ## 2.1.0
 
