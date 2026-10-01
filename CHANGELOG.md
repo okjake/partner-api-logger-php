@@ -2,7 +2,13 @@
 
 # Changelog
 
-## Unreleased
+## 2.1.0
+
+Request scopes and the upstream call trail, bringing the PHP SDK to parity
+with `@partner-api/logger` 3.1.0, and a redaction helper that meets the shared
+PII corpus. It no longer needs ext-bcmath. Log lines are unchanged for code
+that never opens a scope or records a call; two additions a strict test double
+can notice are under Changed.
 
 ### Added
 
@@ -19,9 +25,10 @@
   TypeScript (`UpstreamTrail::DEFAULT_REQUEST_ID_HEADERS`, extended by
   `requestIdHeaders`), and for a transport error no `status`, an `errorCode`
   (`CURLE_COULDNT_CONNECT`, …) and a `message`, with the exception rethrown
-  unchanged. `attempt` is recorded only inside Guzzle's `Middleware::retry()`.
-  Capped at 20 calls / 8 KB per response (measured on the line's own JSON
-  encoding), oldest dropped, marked `_upstreamTruncated` / `_upstreamDropped`.
+  unchanged. The middleware records `attempt` only when it sits inside Guzzle's
+  `Middleware::retry()`. Capped at 20 calls / 8 KB per response (measured on
+  the line's own JSON encoding), oldest dropped, marked `_upstreamTruncated` /
+  `_upstreamDropped`; long fields are cut to ingest's limits.
   URL query strings, fragments and userinfo are stripped client-side,
   including from a transport error's `message`. Every scope ships its own
   calls first, so a request's pre-flight calls ride on its own response. A
@@ -32,13 +39,13 @@
   longest-waiting one is pulled early). A call with no response line left (its
   top-level `runWithContext()` scope ended) is dropped and reported through
   `onError` (reason `invalid-entry`, at most once a minute, the rest at
-  `flush()`), never moved to another request's line; `stats()` gains
-  `upstreamDropped`. A logger-wide call is warned about once, but only when the
-  logger has already logged a logger-wide response — the sign it outlives its
-  request — not on every PHP-FPM request. **No change to any line when nothing
-  is recorded.** New classes: `UpstreamTrail` (constants `MAX_CALLS`,
-  `MAX_BYTES`, `DEFAULT_REQUEST_ID_HEADERS`; `stripUrl()`, `normalise()`).
-  Contract: `packages/logger-spec` 1.5.0.
+  `flush()`), never moved to another request's line, and counted in
+  `stats()['upstreamDropped']`. A logger-wide call is warned about once, but
+  only when the logger has already logged a logger-wide response — the sign it
+  outlives its request — not on every PHP-FPM request. **No change to any
+  line when nothing is recorded.** New classes: `UpstreamTrail` (constants
+  `MAX_CALLS`, `MAX_BYTES`, `DEFAULT_REQUEST_ID_HEADERS`; `stripUrl()`,
+  `normalise()`). Contract: `packages/logger-spec` 1.5.0.
 - **Per-request context isolation (PAPI-5336 parity, FLT-1301).**
   `$logger->runWithContext($context, $fn)` runs `$fn` inside its own context
   scope and returns what it returns; `$logger->child($context)` returns a
@@ -51,8 +58,10 @@
   and when it throws. `runWithContext()` is ambient for the synchronous
   duration of `$fn` only; a server that interleaves requests in one process
   (Swoole coroutines, fibers) uses `child()` per request. `onError` and the
-  end-of-request drain run outside every scope. **No behaviour change for code
-  that never opens a scope** — `setContext()` there stays logger-wide, which is
+  end-of-request drain run outside every scope. The `PartnerLogger` facade
+  forwards `runWithContext()`, `child()`, `upstream()` and
+  `upstreamMiddleware()` to the singleton. **No behaviour change for code that
+  never opens a scope** — `setContext()` there stays logger-wide, which is
   conformant for PHP-FPM.
 
 ### Changed
@@ -103,9 +112,10 @@
   (`tests/RedactPiiLinearTimeTest.php`).
 - **No fail-open.** A PCRE error — a backtrack or JIT stack limit — used to
   return the string it was redacting unchanged (`preg_replace(...) ?? $text`).
-  Now that string comes back as `[REDACTION_FAILED]`, whole, and a key that
-  fails becomes `[REDACTION_FAILED]` too. The helper still never throws: it
-  runs on logging paths that must not break the request they describe.
+  Now that string comes back as `[REDACTION_FAILED]`
+  (`RedactPii::REDACTION_FAILED`), whole, and a key that fails becomes
+  `[REDACTION_FAILED]` too. The helper still never throws: it runs on logging
+  paths that must not break the request they describe.
 
 ### Fixed
 
