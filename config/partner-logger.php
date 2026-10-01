@@ -44,7 +44,8 @@ return [
     'drain_deadline_ms' => (int) env('PARTNER_API_LOG_DRAIN_DEADLINE_MS', 5000),
 
     // Drain anything still buffered from a register_shutdown_function, as a
-    // fallback for requests that never reach Laravel's terminate() path.
+    // fallback for requests that never reach Laravel's terminate() path, and
+    // when a logger is destroyed with entries still buffered.
     'flush_on_shutdown' => (bool) env('PARTNER_API_LOG_FLUSH_ON_SHUTDOWN', true),
 
     // Call fastcgi_finish_request() before that fallback drain, where the SAPI

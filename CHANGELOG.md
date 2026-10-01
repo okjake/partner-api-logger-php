@@ -2,6 +2,37 @@
 
 # Changelog
 
+## 2.1.1
+
+Fixes the end-of-request drain on Laravel Octane and a memory leak on every
+long-lived worker. No API change.
+
+### Fixed
+
+- **Octane drains the logger each request used (FLT-1522).** The service
+  provider's `terminating` callback resolved the logger from the application
+  the provider booted with. Octane clones that application for every request
+  and an un-warmed `Logger` is first built inside the clone, so the callback
+  never saw it: each request's entries waited in a logger that only the
+  worker's exit would drain. The callback now resolves from the container
+  `terminate()` runs on — the request's sandbox under Octane, the application
+  everywhere else — and still only when the request resolved a logger. Warming
+  `Logger::class` is no longer needed for delivery, though still recommended.
+  Queue workers are unchanged: `flush()` per job.
+- **Per-request loggers are no longer kept alive until the worker exits
+  (FLT-1522).** Each logger registered its own `register_shutdown_function`
+  with a closure over itself, so on Octane, RoadRunner or a queue worker every
+  per-request logger — buffer, Guzzle client and options — stayed reachable
+  until the process ended, and memory grew until `--max-requests`. One
+  process-wide hook is now registered, on the first buffered entry, and holds
+  loggers weakly. It still calls `fastcgi_finish_request()` before delivering
+  anything (once, however many loggers it drains), honours `flushOnShutdown`
+  and `finishRequestOnShutdown`, and ends within `drainDeadlineMs` of starting
+  (every logger's budget counts from the hook's start, so several loggers no
+  longer get one each); `shutdown()` / `close()` take a logger off it until it
+  buffers again. A logger dropped with entries still buffered now drains them
+  as it is destroyed instead of at process exit.
+
 ## 2.1.0
 
 Request scopes and the upstream call trail, bringing the PHP SDK to parity

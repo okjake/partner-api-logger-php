@@ -403,7 +403,7 @@ construction.
 | `requestTimeoutMs`        | 5000                    | `REQUEST_TIMEOUT_MS`              | Deadline for one POST, metrics included; `0` disables it                                                          |
 | `autoDrainTimeoutMs`      | 1000                    | `AUTO_DRAIN_TIMEOUT_MS`           | Budget for the drain inside a log call; `0` disables it                                                           |
 | `drainDeadlineMs`         | 5000                    | `DRAIN_DEADLINE_MS`               | Budget for one `flush()` or end-of-request drain, retries included; `0` disables it                               |
-| `flushOnShutdown`         | `true`                  | `FLUSH_ON_SHUTDOWN`               | Drain from a `register_shutdown_function`                                                                         |
+| `flushOnShutdown`         | `true`                  | `FLUSH_ON_SHUTDOWN`               | Drain from a `register_shutdown_function`, and when a logger is destroyed with entries buffered                   |
 | `finishRequestOnShutdown` | `true`                  | `FINISH_REQUEST`                  | Call `fastcgi_finish_request()` before that drain                                                                 |
 
 `batchSize` is capped at `maxBufferSize` and at 1000. Under Laravel each
@@ -423,15 +423,20 @@ append to an in-process buffer and never throw. The buffer drains:
 
 A shutdown function runs only when the process ends, so outside Laravel a
 long-running worker calls `flush()` at the end of each request or job. Under
-Laravel:
+Laravel the provider drains the logger each HTTP request used, after its
+response:
 
-- Under PHP-FPM or `artisan serve`, the provider drains after the response.
-- Under Octane, add `PartnerApi\Logger\Logger::class` to `warm` in
-  `config/octane.php`: one logger then serves the worker, the terminating
-  callback drains it after each request, and the request scope API is what
-  keeps requests apart.
+- Under PHP-FPM or `artisan serve`, the application's logger.
+- Under Octane, the request's logger, warmed or not (since 2.1.1). Warming is
+  still recommended: add `PartnerApi\Logger\Logger::class` to `warm` in
+  `config/octane.php` and one logger serves the worker instead of one being
+  built per request; the request scope API then keeps requests apart.
 - In queue workers nothing drains per job: call `flush()` at the end of each
   job, or from `Queue::after()` / `Queue::failing()`.
+
+The shutdown hook does not keep a logger alive. A logger dropped with entries
+still buffered drains them as it is destroyed, inside the request, so keep one
+logger for the request rather than one per call.
 
 A POST carries at most 1000 entries
 and 1 MB of log lines.
