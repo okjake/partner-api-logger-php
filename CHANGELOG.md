@@ -13,9 +13,10 @@
   reached ingest. It is now built with plain string operations, and the
   `timestamp` on the wire is byte-identical for everything a
   `timestampProvider` could return before — an int, a float such as an
-  uncast `microtime(true) * 1000`, or a numeric string. A provider returning
-  `null`, a bool or an empty string, never a real timestamp, is now reported
-  as `invalid-entry` rather than sent as a 1970 timestamp.
+  uncast `microtime(true) * 1000`, a numeric string, or a `Stringable` such
+  as a `Brick\Math` number. A provider returning `null`, a bool or an empty
+  string, never a real timestamp, is now reported as `invalid-entry` rather
+  than sent as a 1970 timestamp.
 
 ## 2.0.0
 
