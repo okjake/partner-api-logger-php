@@ -315,6 +315,35 @@ class UpstreamTrailTest extends TestCase
         $this->assertSame(['health' => [], 'request' => ['stripe'], 'health-2' => []], $byCorrelation);
     }
 
+    public function testWhetherAScopeBelongsToAnExchangeIsDecidedWhenItOpens(): void
+    {
+        $logger = $this->logger();
+        $logger->runWithContext(['service' => 'app'], function () use ($logger): void {
+            $this->exchange($logger, 'health');
+            // Opened BETWEEN the app scope's exchanges: top-level, so neither
+            // is pulled onto the app's next response.
+            $between = $logger->child();
+            $between->upstream($this->call('child-between'));
+            $logger->runWithContext([], fn () => $logger->upstream($this->call('nested-between')));
+
+            $logger->logRequest(self::KEY, ['method' => 'GET', 'path' => '/health', 'headers' => ['x-correlation-id' => 'health-2']]);
+            // Opened MID-exchange: belongs to it.
+            $logger->child()->upstream($this->call('child-during'));
+            $between->upstream($this->call('child-between-later'));
+            $logger->logResponse(self::KEY, ['statusCode' => 200, 'duration' => 1, 'correlationId' => 'health-2']);
+        });
+        $logger->flush();
+
+        $byCorrelation = [];
+        foreach ($this->responses() as $line) {
+            $byCorrelation[$line['correlation_id']] = $this->names($line);
+        }
+        $this->assertSame(['health' => [], 'health-2' => ['child-during']], $byCorrelation);
+        // The ended nested scope had no line left; the top-level child keeps
+        // its calls for a response of its own.
+        $this->assertSame(1, $logger->stats()['upstreamDropped']);
+    }
+
     public function testANestedScopesDropsCountTowardTheRequestsMarkers(): void
     {
         $logger = $this->logger();
