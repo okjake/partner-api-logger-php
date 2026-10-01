@@ -194,8 +194,12 @@ Under Laravel these are all `config/partner-logger.php` keys
 ### Buffer counters
 
 ```php
-$logger->stats(); // ['buffered' => 12, 'delivered' => 480, 'dropped' => 0]
+$logger->stats();
+// ['buffered' => 12, 'delivered' => 480, 'dropped' => 0, 'upstreamDropped' => 0]
 ```
+
+`upstreamDropped` counts upstream calls dropped for want of a response line —
+see [Upstream call trail](#upstream-call-trail-on-the-response-line-papi-5337).
 
 ## Logging
 
@@ -226,6 +230,10 @@ Recognised keys: `partnerId`, `requestId`, `correlationId`, `path`, `method`,
 `upstreamIntegration` and `upstreamBaseUrl` for attributing calls your tenant
 makes to an upstream integration. Context is snapshotted when the entry is
 buffered, so a later `setContext()` never re-labels entries already queued.
+
+Outside a request scope, context is **logger-wide** — right for PHP-FPM, where
+each request has its own process. On a long-running worker, see
+[Per-request context](#per-request-context-on-a-long-running-worker-papi-5336).
 
 ### HTTP Request / Response Logging
 
@@ -260,6 +268,201 @@ redacts personal data and credentials in bodies before storing them, and it
 replaces any log line larger than 250 KB with a marker that carries no body.
 The full list of limits is in `docs/features/entity-view.md` § Projection
 fidelity limits.
+
+## Per-request context on a long-running worker (PAPI-5336)
+
+PHP-FPM and the CLI run one request per process, so the logger never outlives
+the request and logger-wide context is exactly right. **Nothing changes for
+you there.**
+
+A long-running worker is different. Octane, RoadRunner and Swoole serve many
+requests from one process, and a queue worker runs many jobs, so a singleton
+logger outlives each one. Logger-wide context then leaks: request B starts
+with request A's `partnerId`, `correlation_id` and `upstream_integration`, and
+an upstream call request A recorded but never answered ships on request B's
+response. Open a scope per request:
+
+```php
+// Octane / RoadRunner middleware — once, at the edge of the request.
+public function handle(Request $request, Closure $next)
+{
+    return $this->logger->runWithContext(
+        ['requestId' => $request->header('x-request-id')],
+        fn () => $next($request),
+    );
+}
+
+// Anywhere downstream, the shared logger resolves to this request's scope.
+$logger->setContext(['direction' => 'outbound', 'upstreamIntegration' => 'stripe']);
+$logger->info($apiKey, 'Calling Stripe'); // carries THIS request's requestId
+```
+
+- **`runWithContext($context, $fn)`** starts the scope as a copy of the current
+  context merged with `$context`, runs `$fn`, and returns what `$fn` returns.
+  Inside it, `setContext()` — and the fields `logRequest()`/`logResponse()` set
+  — belong to that request only. Scopes nest. The previous scope comes back
+  when `$fn` returns **and** when it throws (the exception reaches you
+  unchanged). `$fn` also receives a logger bound to the scope
+  (`fn (Logger $scoped) => …`).
+- **`child($context)`** returns a `Logger` bound to a new scope. It shares the
+  parent's buffer, transport, counters, `onError`, `flush()` and `stats()`.
+  Create one per request and pass it down.
+- **Coroutines and fibers.** `runWithContext()` is ambient for the
+  _synchronous_ duration of `$fn`, which is what Octane and RoadRunner give you
+  (one request per worker at a time). A server that interleaves requests
+  inside one process — Swoole coroutines, AMPHP/ReactPHP fibers — must use
+  `child()` per request instead: it never reads ambient state.
+- **Log the response inside the scope.** The scope ends when `$fn` returns, so
+  a `logResponse()` from a terminate hook that runs after `$fn` lands outside
+  it.
+- **The SDK's own events belong to no request.** `onError` runs outside every
+  scope, so a hook that logs on this logger writes a logger-wide line. The
+  end-of-request drain does too.
+- **Unchanged if you never open a scope.** Calls outside any scope behave
+  exactly as before, and the `logRequest()`/`logResponse()` pairing by
+  `correlationId` is the same inside a scope as outside it.
+
+Under Laravel the facade resolves the same singleton, so
+`PartnerLogger::runWithContext(...)` and `PartnerLogger::child(...)` work as
+above.
+
+## Upstream call trail on the response line (PAPI-5337)
+
+When a partner request fails because something _you_ called failed — Stripe
+timed out, your pricing service returned a 503 — the response line can say so.
+Record each upstream call against the request, and `logResponse()` ships them
+as `upstream: [...]` on the `Outgoing response` line, then clears them:
+
+```php
+use GuzzleHttp\Client;
+use GuzzleHttp\HandlerStack;
+
+// Once, where you build the client. Every request through it is recorded
+// against whichever request makes it.
+$stack = HandlerStack::create();
+$stack->push($logger->upstreamMiddleware('stripe'));
+$stripe = new Client(['handler' => $stack]);
+
+// In a handler:
+$correlationId = $logger->logRequest($apiKey, ['method' => 'POST', 'path' => '/orders']);
+$charge = $stripe->post('https://api.stripe.com/v1/charges', ['form_params' => $body]);
+
+// Anything that is not Guzzle: record it yourself.
+$logger->upstream([
+    'name' => 'pricing',
+    'method' => 'GET',
+    'url' => 'https://pricing.internal/quote',
+    'status' => 200,
+    'durationMs' => 41,
+]);
+
+$logger->logResponse($apiKey, ['statusCode' => 201, 'duration' => $ms, 'correlationId' => $correlationId]);
+```
+
+The response line then carries, in the order the calls were made:
+
+```json
+"upstream": [
+  { "name": "stripe", "method": "POST", "url": "https://api.stripe.com/v1/charges", "status": 200, "durationMs": 212, "requestId": "req_8Hk2…" },
+  { "name": "pricing", "method": "GET", "url": "https://pricing.internal/quote", "status": 200, "durationMs": 41 }
+]
+```
+
+- **`$logger->upstream($call)`** records `name`, `method`, `url`,
+  `durationMs`, and optionally `status`, `requestId`, `errorCode`, `message`
+  and `attempt` — the spec's field names, exactly. `name` is any label you
+  like; there is no registration. Omit `status` for a network error (no HTTP
+  response) and set `errorCode`. `attempt` is yours to set if you retry; the
+  SDK never guesses it. Numbers follow the TypeScript SDK's rules: `200.0` is
+  the status 200, the string `'200'` is not a status. A call missing
+  `name`/`method`/`url`, or with a `method` that is not an HTTP method
+  (letters, `-`, `_`; at most 16), a non-HTTP `status` or a bad `durationMs`, is
+  dropped and reported to `onError` — `upstream()` never throws.
+- **`$logger->upstreamMiddleware($name, $options = [])`** is the PHP
+  counterpart of the TypeScript SDK's `wrapFetch`. Guzzle composes behaviour
+  on a `HandlerStack` rather than by wrapping a function, so it returns a
+  middleware to push. Every request through it records method, URL, status,
+  duration, and the vendor's request id from the first of `request-id`,
+  `x-request-id`, `x-amzn-requestid`, `x-amz-request-id`, `x-ms-request-id`,
+  `x-github-request-id` and `cf-ray` present on the response
+  (`UpstreamTrail::DEFAULT_REQUEST_ID_HEADERS`). Add your own with
+  `['requestIdHeaders' => ['x-vendor-trace']]`; those are checked first.
+  - An HTTP error is recorded as its status — whether Guzzle's `http_errors`
+    turns it into an exception or not. The response body is never read.
+  - A transport error (DNS, refused, timeout) is recorded with no status, an
+    `errorCode` (`CURLE_COULDNT_CONNECT`, `CURLE_OPERATION_TIMEDOUT`, … or the
+    exception's class name) and the transport's `message`. The exception
+    reaches your code unchanged.
+  - **Retries.** A `HandlerStack` nests in push order, so the first middleware
+    pushed is the outermost. Push Guzzle's `Middleware::retry()` _before_ this
+    one and every attempt is its own call, with `attempt` taken from the retry
+    middleware's own counter. Push it after, and a retried request is one call
+    with no `attempt`.
+  - **Redirects.** Pushed onto `HandlerStack::create()`, it sits inside the
+    redirect middleware, so each redirect hop is its own call. `unshift()` it
+    instead to record one call per request.
+  - Recording never throws into your request; a failure to record is reported
+    to `onError`. The logger's own POSTs to ingest are never recorded, even
+    if the logger shares the client.
+  - Each call is attributed to the scope active when the request is _sent_,
+    so one client built at boot serves every request correctly under
+    `runWithContext()` — async requests (`getAsync()`, pools) included. A
+    middleware made from a `child()` always records into that child's scope.
+- **Only the response line carries it.** No extra lines are emitted, and
+  request/info lines are unchanged. A response with no calls has no `upstream`
+  key at all — the line is byte-identical to earlier versions.
+- **Query strings never leave the process.** The URL's query string, fragment
+  and userinfo are stripped before the call is stored (ingest strips them
+  again). The middleware also strips them from a transport error's message,
+  where Guzzle repeats the full URL.
+- **Capped at 20 calls / 8 KB** per response. Beyond either, the oldest calls
+  are dropped and the line gets `_upstreamTruncated: true` and
+  `_upstreamDropped: n`. Long `name`/`url`/`errorCode`/`message` values are cut
+  to 128/2048/128/1024 characters. The 8 KB is measured on the trail exactly
+  as the line encodes it, which is never less than ingest measures, so a PHP
+  trail never trips ingest's cap.
+- **PHP-FPM needs nothing more.** Outside any scope, calls are held
+  logger-wide and ship on the next `logResponse()` — on FPM, this request's.
+  If a logger records a logger-wide call after it has already logged a
+  logger-wide response (it is outliving its request), that is reported once
+  through `onError`.
+- **On a long-running worker, scope it per request** (see above). The trail
+  then lives in the request's scope, so one request never ships another's
+  calls. These rules match the TypeScript SDK:
+  - **Every scope ships its own calls first.** A _request_ is a scope that has
+    called `logRequest()` or `logResponse()`; it is _mid-exchange_ between the
+    two. Pre-flight calls made before `logRequest()` (an auth lookup, say)
+    ship on that request's own response.
+  - **A nested scope belongs to the exchange it was opened in.** A nested
+    `runWithContext()` or a `child()` opened while the nearest request above
+    is mid-exchange belongs to that request. Unless it becomes a request
+    itself, its calls go onto the request's line: a nested `runWithContext()`
+    hands them over when its `$fn` returns or throws, and a `child()` is
+    pulled when the request responds. One opened between exchanges, or with
+    no request above, is top-level and keeps its calls.
+  - **Ordering and caps.** Handed-over calls keep call order, the caps apply
+    on the request's trail, and a nested scope's own drops count toward
+    `_upstreamDropped`. Nothing is pulled twice. Only calls move: a `child()`
+    keeps its own context.
+  - **Bounded waiting.** At most 1000 `child()` loggers wait, holding calls,
+    for one request to pull them; past that the longest-waiting one is pulled
+    early. The line that ships is the same.
+  - **Many responses per scope.** Every request clears its trail after each
+    response and keeps collecting for the next.
+- **A call with no response line left is dropped, not parked.** When a
+  top-level `runWithContext()` ends — its `$fn` returns or throws — any call
+  it still holds, or that is recorded on its scoped logger later, is dropped.
+  It never moves to another request's line or to the logger-wide trail. Drops
+  are reported through `onError` (reason `invalid-entry`), at most once a
+  minute, and whatever that held back is reported at `flush()`. Every drop is
+  counted in `stats()['upstreamDropped']`. A top-level `child()` never ends:
+  calls recorded on it after its last response ship on its next one.
+- **Where PHP differs from TypeScript, and why.** TypeScript treats a
+  synchronous return from `runWithContext`'s callback as _not_ the end of the
+  request, because Express's `() => next()` returns at once and the request
+  carries on through `AsyncLocalStorage`. PHP has no continuation that
+  outlives the call stack, so here the scope ends when `$fn` returns — there
+  is no third "returned" state.
 
 ## PII Redaction Helper
 

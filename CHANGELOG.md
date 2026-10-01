@@ -2,6 +2,59 @@
 
 # Changelog
 
+## Unreleased
+
+### Added
+
+- **Upstream call trail on the response line (PAPI-5337 parity, FLT-1301).**
+  `$logger->upstream($call)` records an upstream call — `name`, `method`,
+  `url`, `durationMs` and the optional `status`, `requestId`, `errorCode`,
+  `message` and `attempt` — against the current request, and `logResponse()`
+  ships the request's calls as `upstream: [...]` on the `Outgoing response`
+  line, in call order, then clears them. `$logger->upstreamMiddleware($name)`
+  returns a Guzzle middleware — the PHP counterpart of the
+  TypeScript SDK's `wrapFetch` — that records every request sent through it:
+  method, URL, status (an HTTP error status whether or not `http_errors`
+  raises it), duration, the vendor request id from the same default headers as
+  TypeScript (`UpstreamTrail::DEFAULT_REQUEST_ID_HEADERS`, extended by
+  `requestIdHeaders`), and for a transport error no `status`, an `errorCode`
+  (`CURLE_COULDNT_CONNECT`, …) and a `message`, with the exception rethrown
+  unchanged. `attempt` is recorded only inside Guzzle's `Middleware::retry()`.
+  Capped at 20 calls / 8 KB per response (measured on the line's own JSON
+  encoding), oldest dropped, marked `_upstreamTruncated` / `_upstreamDropped`.
+  URL query strings, fragments and userinfo are stripped client-side,
+  including from a transport error's `message`. Every scope ships its own
+  calls first, so a request's pre-flight calls ride on its own response. A
+  nested scope opened while its enclosing request is mid-exchange belongs to
+  that request: a nested `runWithContext()` hands its calls over when its
+  callable returns or throws, and a `child()` is pulled when the request
+  responds (at most 1000 children wait on one request; past that the
+  longest-waiting one is pulled early). A call with no response line left (its
+  top-level `runWithContext()` scope ended) is dropped and reported through
+  `onError` (reason `invalid-entry`, at most once a minute, the rest at
+  `flush()`), never moved to another request's line; `stats()` gains
+  `upstreamDropped`. A logger-wide call is warned about once, but only when the
+  logger has already logged a logger-wide response — the sign it outlives its
+  request — not on every PHP-FPM request. **No change to any line when nothing
+  is recorded.** New classes: `UpstreamTrail` (constants `MAX_CALLS`,
+  `MAX_BYTES`, `DEFAULT_REQUEST_ID_HEADERS`; `stripUrl()`, `normalise()`).
+  Contract: `packages/logger-spec` 1.5.0.
+- **Per-request context isolation (PAPI-5336 parity, FLT-1301).**
+  `$logger->runWithContext($context, $fn)` runs `$fn` inside its own context
+  scope and returns what it returns; `$logger->child($context)` returns a
+  scope-bound `Logger` sharing this one's buffer, transport, counters and
+  `onError`. Inside a scope, `setContext()` and the fields
+  `logRequest()`/`logResponse()` set belong to that request only, so a
+  long-running worker (Octane, RoadRunner, a queue worker) no longer carries
+  one request's `partnerId`, `upstream_integration` or `correlation_id` into
+  the next. Scopes nest, and the previous one is restored when `$fn` returns
+  and when it throws. `runWithContext()` is ambient for the synchronous
+  duration of `$fn` only; a server that interleaves requests in one process
+  (Swoole coroutines, fibers) uses `child()` per request. `onError` and the
+  end-of-request drain run outside every scope. **No behaviour change for code
+  that never opens a scope** — `setContext()` there stays logger-wide, which is
+  conformant for PHP-FPM.
+
 ## 2.0.0
 
 Buffered, non-throwing delivery (PAPI-3672), bringing the PHP SDK to parity

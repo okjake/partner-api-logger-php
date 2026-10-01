@@ -757,18 +757,18 @@ class BufferedTransportTest extends TestCase
             [null, new \RuntimeException('down')],
         );
 
-        $this->assertSame(['buffered' => 0, 'delivered' => 0, 'dropped' => 0], $logger->stats());
+        $this->assertSame(['buffered' => 0, 'delivered' => 0, 'dropped' => 0, 'upstreamDropped' => 0], $logger->stats());
 
         $logger->info(self::KEY, 'delivered');
         $logger->flush();
-        $this->assertSame(['buffered' => 0, 'delivered' => 1, 'dropped' => 0], $logger->stats());
+        $this->assertSame(['buffered' => 0, 'delivered' => 1, 'dropped' => 0, 'upstreamDropped' => 0], $logger->stats());
 
         $logger->info(self::KEY, 'lost');
         $logger->flush();
-        $this->assertSame(['buffered' => 0, 'delivered' => 1, 'dropped' => 1], $logger->stats());
+        $this->assertSame(['buffered' => 0, 'delivered' => 1, 'dropped' => 1, 'upstreamDropped' => 0], $logger->stats());
 
         $logger->info(self::KEY, 'waiting');
-        $this->assertSame(['buffered' => 1, 'delivered' => 1, 'dropped' => 1], $logger->stats());
+        $this->assertSame(['buffered' => 1, 'delivered' => 1, 'dropped' => 1, 'upstreamDropped' => 0], $logger->stats());
     }
 
     // --------------------------------------------------------------- direct mode

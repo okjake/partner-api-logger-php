@@ -55,9 +55,33 @@ use Ramsey\Uuid\Uuid;
  * `metric()` / `metrics()` are deliberately NOT buffered: a metric submission
  * is an explicit write the caller is entitled to a receipt for, so it still
  * posts synchronously and still raises `LoggerException` on failure.
+ *
+ * **Request scopes (PAPI-5336, FLT-1301).** `setContext()` with no scope open
+ * is logger-wide, which is conformant for PHP-FPM and CLI: one request per
+ * process. A long-running worker (Octane, RoadRunner, Swoole, a queue worker)
+ * serves many requests from one logger, so `runWithContext()` and `child()`
+ * give each one its own context and upstream trail. See `RequestScope`.
  */
 class Logger
 {
+    /**
+     * The `json_encode` flags every log line is written with. The upstream
+     * trail's byte cap measures with the same flags, so it counts exactly the
+     * bytes the trail occupies on the wire.
+     *
+     * @internal
+     */
+    public const LINE_JSON_FLAGS = JSON_UNESCAPED_SLASHES;
+
+    /**
+     * A Guzzle request option the logger sets on its own POSTs to ingest, so
+     * an `upstreamMiddleware()` on a client that also serves as the logger's
+     * transport never records them as the caller's upstream calls.
+     *
+     * @internal
+     */
+    public const INTERNAL_REQUEST_OPTION = 'partner_api_logger_internal';
+
     /** Log calls buffer and report failures to `onError`. The default. */
     public const MODE_BUFFERED = 'buffered';
 
@@ -86,6 +110,21 @@ class Logger
     private const DEFAULT_REQUEST_TIMEOUT_MS = 5000;
     private const DEFAULT_AUTO_DRAIN_TIMEOUT_MS = 1000;
     private const DEFAULT_DRAIN_DEADLINE_MS = 5000;
+
+    /** At most one "upstream calls dropped" report per this window (TS: the same). */
+    private const UPSTREAM_LOST_REPORT_INTERVAL_MS = 60000;
+
+    /**
+     * At most this many nested scopes wait, holding calls, to be pulled by one
+     * request (TS: the same). In PHP a nested `runWithContext()` scope always
+     * ends — and hands its calls over — before the request around it can, so
+     * only `child()` loggers ever wait here: a worker whose app-level scope
+     * logged a request at boot and will respond at shutdown would otherwise
+     * retain every discarded child that recorded a call. Past the bound the
+     * longest-waiting child's calls join the request's trail early; the line
+     * that ships is the same.
+     */
+    private const MAX_WAITING_HELPERS = 1000;
 
     /**
      * Which drain is running, which is what decides how much time the caller
@@ -144,8 +183,39 @@ class Logger
 
     private string $tenantToken;
     private string $baseUrl;
-    private array $context = [];
     private ClientInterface $httpClient;
+
+    /**
+     * What `setContext()` writes to outside any request scope: the logger-wide
+     * context, exactly as before scopes existed.
+     */
+    private RequestScope $rootScope;
+
+    /**
+     * The scope open right now: the innermost `runWithContext()` on the call
+     * stack, or the scope a `child()` logger bound for the duration of one of
+     * its calls. Null means the root.
+     *
+     * One variable serves both, because PHP has no `await`: the TypeScript SDK
+     * needs `AsyncLocalStorage` to carry a scope across suspended work, while
+     * here every scope lasts exactly as long as a synchronous call. It is NOT
+     * fiber- or coroutine-aware — a server that interleaves requests inside
+     * one process (Swoole coroutines, AMPHP/ReactPHP fibers) must use
+     * `child()` per request, which never reads this.
+     */
+    private ?RequestScope $currentScope = null;
+
+    /** Orders trail entries by when each call STARTED, across all scopes. */
+    private int $upstreamSeq = 0;
+
+    /** Upstream calls dropped for want of a response line. */
+    private int $upstreamLostTotal = 0;
+    private int $upstreamLostUnreported = 0;
+    private ?float $upstreamLostReportedAt = null;
+
+    /** Logger-wide `logResponse()` lines shipped — see reportRootUpstream(). */
+    private int $rootResponses = 0;
+    private bool $reportedRootUpstream = false;
 
     /** @var callable(): int */
     private $timestampProvider;
@@ -266,6 +336,7 @@ class Logger
             );
         }
 
+        $this->rootScope = new RequestScope([], null);
         $this->tenantToken = $tenantToken;
         $this->baseUrl = $baseUrl ?? 'https://ingest.partnerapi.com';
         $this->httpClient = $httpClient ?? new Client();
@@ -328,11 +399,555 @@ class Logger
     }
 
     /**
+     * Merges `$fields` into the ACTIVE scope's context.
+     *
+     * Inside {@see Logger::runWithContext()} (or on a {@see Logger::child()})
+     * that is the request's own scope, invisible to every other request.
+     * Outside any scope it is logger-wide, as it always was — right for
+     * PHP-FPM, wrong on a long-running worker, which should open a scope per
+     * request before calling this.
+     *
      * @param array<string, mixed> $fields
      */
     public function setContext(array $fields): void
     {
-        $this->context = array_merge($this->context, $fields);
+        $scope = $this->activeScope();
+        $scope->context = array_merge($scope->context, $fields);
+    }
+
+    /**
+     * Runs `$fn` inside a new request scope (PAPI-5336) and returns what it
+     * returns.
+     *
+     * The scope starts as a copy of the current context merged with
+     * `$context`. Everything the request does to context while `$fn` runs —
+     * `setContext()`, and the fields `logRequest()` / `logResponse()` set —
+     * and every upstream call it records stays in that scope, so the next
+     * request on the same long-lived logger starts clean. Scopes nest. The
+     * previous scope is restored when `$fn` returns AND when it throws (the
+     * exception propagates unchanged).
+     *
+     * `$fn` receives a logger bound to the scope (`fn (Logger $scoped) => …`),
+     * which is the same scope `$this` resolves to while `$fn` runs.
+     *
+     * The scope ENDS when `$fn` returns or throws. Upstream calls it still
+     * holds then go to the request it was opened under, if that request was
+     * mid-exchange; with none, they are dropped and reported through
+     * `onError` (see `stats()['upstreamDropped']`). So log the response
+     * inside `$fn`, not from a terminate hook that runs after it.
+     *
+     * Ambient for the synchronous duration of `$fn` only — not across
+     * coroutines or fibers. On a server that interleaves requests in one
+     * process, use {@see Logger::child()} per request.
+     *
+     * ```php
+     * // Octane / RoadRunner middleware — once, at the edge of the request.
+     * return $logger->runWithContext(
+     *     ['partnerId' => $partnerId],
+     *     fn () => $next($request),
+     * );
+     * ```
+     *
+     * @template T
+     * @param array<string, mixed> $context
+     * @param callable(Logger): T  $fn
+     * @return T
+     */
+    public function runWithContext(array $context, callable $fn): mixed
+    {
+        $scope = $this->openScope($context);
+        $outer = $this->currentScope;
+        $this->currentScope = $scope;
+
+        try {
+            return $fn($this->bindScope($scope));
+        } finally {
+            $this->currentScope = $outer;
+            $this->endScope($scope);
+        }
+    }
+
+    /**
+     * Returns a logger bound to a new scope (PAPI-5336): a copy of the current
+     * context merged with `$context`. Its `setContext()`, request/response
+     * logging and upstream calls touch only that scope; it shares this
+     * logger's buffer, transport, counters, `onError`, `flush()` and
+     * `stats()`.
+     *
+     * Needs nothing from the runtime, so it is the portable way to isolate a
+     * request — including on coroutine servers, where `runWithContext()`'s
+     * ambient scope cannot follow a request. A child never ends: create one
+     * per request and drop it afterwards.
+     *
+     * @param array<string, mixed> $context
+     */
+    public function child(array $context = []): Logger
+    {
+        // A child records its calls in its own trail. Opened while the
+        // request above is mid-exchange, it belongs to that request, which
+        // pulls its calls when it responds or ends unless the child becomes a
+        // request itself. Otherwise it is top-level and clears after each
+        // response. Context is a per-scope copy either way.
+        return $this->bindScope($this->openScope($context));
+    }
+
+    /**
+     * Records one upstream call against the current request (PAPI-5337).
+     *
+     * `$call` has exactly the spec's keys: `name`, `method`, `url`, `status`
+     * (omit it for a network error), `durationMs`, and optionally
+     * `requestId`, `errorCode`, `message`, `attempt`. The call ships as an
+     * entry of `upstream: [...]` on this request's next `logResponse()` line —
+     * and on no other line — in the order calls were made; then the trail is
+     * cleared. Capped at 20 calls / 8 KB, oldest dropped and the line marked.
+     *
+     * Never throws. A call ingest would reject (no `name`/`method`/`url`, a
+     * non-HTTP `status`, a bad `durationMs`) is dropped and reported through
+     * `onError`. The URL's query string, fragment and userinfo are stripped
+     * before it is stored.
+     *
+     * Outside any scope the call is held logger-wide and ships on the next
+     * `logResponse()` made outside a scope — correct for PHP-FPM, where that
+     * is this request's response.
+     *
+     * @param array<string, mixed> $call
+     */
+    public function upstream(array $call): void
+    {
+        try {
+            $this->recordUpstream($this->activeScope(), $this->upstreamSeq++, $call);
+        } catch (\Throwable $e) {
+            $this->reportUpstreamFailure($e);
+        }
+    }
+
+    /**
+     * A Guzzle middleware that records every call made through it as an
+     * upstream call named `$name` (PAPI-5337) — the PHP counterpart of the
+     * TypeScript SDK's `wrapFetch()`. Guzzle composes behaviour on a
+     * `HandlerStack` rather than by wrapping a function, so this hands back
+     * the middleware to push:
+     *
+     * ```php
+     * $stack = HandlerStack::create();
+     * $stack->push($logger->upstreamMiddleware('stripe'));
+     * $stripe = new Client(['handler' => $stack]);
+     * ```
+     *
+     * Each call records `method`, `url` (query string stripped), `status`,
+     * `durationMs` and the vendor's request id — the first of
+     * `$options['requestIdHeaders']` and then
+     * {@see UpstreamTrail::DEFAULT_REQUEST_ID_HEADERS} present on the
+     * response. An HTTP error status is recorded as that status, whether
+     * Guzzle's `http_errors` turns it into an exception or not; the response
+     * body is never read. A transport error (DNS, refused, timeout) is
+     * recorded with no `status`, an `errorCode` and a `message`, and the
+     * exception reaches the caller unchanged. `attempt` is recorded when the
+     * middleware sits inside Guzzle's `Middleware::retry()` — a `HandlerStack`
+     * nests in push order, so push the retry middleware FIRST and this one
+     * after it — from the retry counter that middleware passes down; then
+     * every attempt is its own call. Anywhere else `attempt` is omitted and
+     * a retried request is one call.
+     *
+     * The call is attributed to the scope active when the request is SENT, so
+     * one client built at boot serves every request correctly under
+     * `runWithContext()`; a middleware made from a `child()` always records
+     * into that child's scope. Recording never throws into the request: a
+     * failure to record is reported through `onError`.
+     *
+     * @param array{requestIdHeaders?: list<string>} $options
+     * @return callable(callable): callable
+     *
+     * @throws LoggerException On an unknown option — at setup, never per call.
+     */
+    public function upstreamMiddleware(string $name, array $options = []): callable
+    {
+        return $this->makeUpstreamMiddleware($name, $options, null);
+    }
+
+    /**
+     * @param array<string, mixed> $options
+     * @return callable(callable): callable
+     *
+     * @internal Shared with {@see ScopedLogger}, which binds `$boundScope`.
+     */
+    protected function makeUpstreamMiddleware(string $name, array $options, ?RequestScope $boundScope): callable
+    {
+        $unknown = array_diff(array_keys($options), ['requestIdHeaders']);
+        if ($unknown !== []) {
+            throw new LoggerException(
+                'Unknown upstreamMiddleware option(s): ' . implode(', ', $unknown)
+                . '. Known options: requestIdHeaders'
+            );
+        }
+        $extra = $options['requestIdHeaders'] ?? [];
+        if (!is_array($extra) || array_filter($extra, static fn ($h) => !is_string($h)) !== []) {
+            throw new LoggerException('upstreamMiddleware option requestIdHeaders must be a list of header names');
+        }
+
+        return new UpstreamMiddleware(
+            $name,
+            array_values(array_merge($extra, UpstreamTrail::DEFAULT_REQUEST_ID_HEADERS)),
+            // Resolved when the request is sent: the scope the caller is in now.
+            function () use ($boundScope): array {
+                return [$boundScope ?? $this->activeScope(), $this->upstreamSeq++, $this->clockMs()];
+            },
+            function (RequestScope $scope, int $seq, float $startedMs, array $call): void {
+                try {
+                    $call['durationMs'] = max(0, (int) round($this->clockMs() - $startedMs));
+                    $this->recordUpstream($scope, $seq, $call);
+                } catch (\Throwable $e) {
+                    $this->reportUpstreamFailure($e);
+                }
+            },
+        );
+    }
+
+    /**
+     * Runs `$fn` with `$scope` as the active scope, restoring the previous
+     * one afterwards whatever happens.
+     *
+     * @template T
+     * @param callable(): T $fn
+     * @return T
+     *
+     * @internal Used by {@see ScopedLogger} to run a method in its scope.
+     */
+    protected function withScope(RequestScope $scope, callable $fn): mixed
+    {
+        $outer = $this->currentScope;
+        $this->currentScope = $scope;
+        try {
+            return $fn();
+        } finally {
+            $this->currentScope = $outer;
+        }
+    }
+
+    /** The scope context reads and writes resolve to right now. */
+    private function activeScope(): RequestScope
+    {
+        return $this->currentScope ?? $this->rootScope;
+    }
+
+    /** @param array<string, mixed> $context */
+    private function openScope(array $context): RequestScope
+    {
+        $parent = $this->activeScope();
+        $scope = new RequestScope(array_merge($parent->context, $context), $parent);
+        // Decided now, never re-decided (ruling 2026-09-26). Opened
+        // mid-exchange, the scope belongs to that exchange; opened between
+        // exchanges (an app scope after its health check), it is top-level.
+        $request = $this->nearestRequest($scope);
+        $scope->host = $request !== null && $request->midExchange ? $request : null;
+
+        return $scope;
+    }
+
+    private function bindScope(RequestScope $scope): Logger
+    {
+        return new ScopedLogger($this, $scope);
+    }
+
+    /**
+     * Runs `$fn` outside every request scope. For logger-internal work that
+     * belongs to no request (spec § Per-request context isolation, rule 4):
+     * the `onError` hook and the end-of-request drain. A hook that logs on
+     * this logger therefore writes a logger-wide line, never one stamped with
+     * whichever request happened to trigger the report.
+     *
+     * @template T
+     * @param callable(): T $fn
+     * @return T
+     */
+    private function atRootScope(callable $fn): mixed
+    {
+        $outer = $this->currentScope;
+        $this->currentScope = null;
+        try {
+            return $fn();
+        } finally {
+            $this->currentScope = $outer;
+        }
+    }
+
+    /**
+     * The nearest enclosing REQUEST scope (ruling 2026-09-26: the nearest
+     * scope above that has called `logRequest` or `logResponse`), or null.
+     * The root is never one: it is the logger-wide trail, not a request.
+     */
+    private function nearestRequest(RequestScope $scope): ?RequestScope
+    {
+        for ($s = $scope->parent; $s !== null; $s = $s->parent) {
+            if ($s->isRequest) {
+                return $s;
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * The trail a call recorded in `$scope` right now goes to (rulings
+     * 2026-09-26). A scope records its OWN calls in its OWN trail first, so a
+     * request's pre-flight calls ship on its own response.
+     *
+     * - A live scope (root, request, running `runWithContext()`, `child()`):
+     *   its own trail. If it is not itself a request and has a host, it
+     *   registers as that host's helper, so the host pulls the calls onto its
+     *   own line when it responds or ends.
+     * - An ENDED scope: its host's destination; with no host, its own trail,
+     *   which is closed — the call is reported and dropped, never parked.
+     * - A live, non-request scope whose host has ENDED: that host's
+     *   destination. A live scope that has become a request keeps its own.
+     */
+    private function upstreamDestination(RequestScope $scope): UpstreamTrail
+    {
+        if ($scope === $this->rootScope) {
+            return $scope->trail;
+        }
+
+        $host = $scope->host;
+        if ($scope->ended || (!$scope->isRequest && $host !== null && $host->ended)) {
+            return $host !== null ? $this->upstreamDestination($host) : $scope->trail;
+        }
+        if ($host !== null && !$scope->isRequest) {
+            $this->registerHelper($host, $scope);
+        }
+
+        return $scope->trail;
+    }
+
+    /**
+     * A request responds or ends: its helpers' calls join its trail, in
+     * start order. A helper whose nearest request is now another scope is
+     * handed to that one instead.
+     */
+    private function pullHelpers(RequestScope $request): void
+    {
+        foreach ($request->helpers as $id => $helper) {
+            // A report raised mid-loop runs user code; never pull twice.
+            if (isset($request->helpers[$id])) {
+                $this->pullHelper($request, $helper);
+            }
+        }
+    }
+
+    private function pullHelper(RequestScope $request, RequestScope $helper): void
+    {
+        unset($request->helpers[spl_object_id($helper)]);
+        // (A helper that became a request unregistered itself: markRequest.)
+        // A scope between the helper and this request has since become a
+        // request: the helper's calls are that request's now.
+        $nearest = $this->nearestRequest($helper);
+        if ($nearest !== null && $nearest !== $request) {
+            $helper->host = $nearest;
+            $this->registerHelper($nearest, $helper);
+            return;
+        }
+        $this->reportUpstreamLost($helper->trail->handOff($request->trail));
+    }
+
+    /**
+     * Registers `$helper` to be pulled by `$request`, keeping the registry
+     * bounded ({@see self::MAX_WAITING_HELPERS}): past the bound, the scope
+     * that has waited longest is pulled now.
+     */
+    private function registerHelper(RequestScope $request, RequestScope $helper): void
+    {
+        $request->helpers[spl_object_id($helper)] ??= $helper;
+        if (count($request->helpers) <= self::MAX_WAITING_HELPERS) {
+            return;
+        }
+        $oldest = $request->helpers[array_key_first($request->helpers)];
+        if ($oldest !== $helper) {
+            $this->pullHelper($request, $oldest);
+        }
+    }
+
+    /**
+     * A `runWithContext()` scope's `$fn` returned or threw. What it holds —
+     * its helpers' calls included, if it is a request — goes to the request
+     * it belongs to; with none, it is reported and dropped.
+     *
+     * Runs in a `finally`, so it must not throw: it would replace the
+     * exception `$fn` is propagating.
+     */
+    private function endScope(RequestScope $scope): void
+    {
+        try {
+            $scope->ended = true;
+            if ($scope->host !== null) {
+                unset($scope->host->helpers[spl_object_id($scope)]);
+            }
+            $this->pullHelpers($scope);
+            $destination = $this->upstreamDestination($scope);
+            if ($destination !== $scope->trail) {
+                $this->reportUpstreamLost($scope->trail->handOff($destination));
+            } else {
+                $this->reportUpstreamLost($scope->trail->close());
+            }
+        } catch (\Throwable $e) {
+            $this->reportUpstreamFailure($e);
+        }
+    }
+
+    /**
+     * Upstream calls with no request line left to ship on: dropped, and
+     * reported through `onError`. Every call is counted; the report itself is
+     * rate-limited to one per {@see self::UPSTREAM_LOST_REPORT_INTERVAL_MS}
+     * and carries the calls dropped since the last report and in total.
+     */
+    private function reportUpstreamLost(int $count): void
+    {
+        if ($count <= 0) {
+            return;
+        }
+        $this->upstreamLostTotal += $count;
+        $this->upstreamLostUnreported += $count;
+        $now = $this->clockMs();
+        if (
+            $this->upstreamLostReportedAt !== null
+            && $now - $this->upstreamLostReportedAt < self::UPSTREAM_LOST_REPORT_INTERVAL_MS
+        ) {
+            return;
+        }
+        $this->reportUnreportedUpstreamLost($now);
+    }
+
+    /**
+     * Reports whatever the rate limit has held back. Called from
+     * reportUpstreamLost() and from `flush()`, so a burst inside one window
+     * is still reported in full before the process goes away.
+     */
+    private function reportUnreportedUpstreamLost(?float $now = null): void
+    {
+        if ($this->upstreamLostUnreported === 0) {
+            return;
+        }
+        $this->upstreamLostReportedAt = $now ?? $this->clockMs();
+        $since = $this->upstreamLostUnreported;
+        $this->upstreamLostUnreported = 0;
+        // Same wording as the TypeScript SDK up to the cause, which is PHP's.
+        $this->report(new LoggerErrorEvent(
+            LoggerErrorEvent::REASON_INVALID_ENTRY,
+            sprintf(
+                'logger.upstream(): dropped %d upstream call%s with no response line left to ship on — %s request scope ended (runWithContext\'s fn returned or threw) with no enclosing request to hand %s to (%d dropped in total)',
+                $since,
+                $since === 1 ? '' : 's',
+                $since === 1 ? 'its' : 'their',
+                $since === 1 ? 'it' : 'them',
+                $this->upstreamLostTotal,
+            ),
+            0,
+            $this->droppedTotal,
+        ));
+    }
+
+    /**
+     * Normalises and stores one call in the trail `$scope` resolves to.
+     *
+     * @param array<string, mixed> $call
+     */
+    private function recordUpstream(RequestScope $scope, int $seq, array $call): void
+    {
+        $normalised = UpstreamTrail::normalise($call);
+        if (is_string($normalised)) {
+            $this->report(new LoggerErrorEvent(
+                LoggerErrorEvent::REASON_INVALID_ENTRY,
+                "logger.upstream(): {$normalised} — call not recorded",
+                0,
+                $this->droppedTotal,
+            ));
+            return;
+        }
+
+        $destination = $this->upstreamDestination($scope);
+        if ($destination === $this->rootScope->trail) {
+            $this->reportRootUpstream();
+        }
+        if (!$destination->record($seq, $normalised)) {
+            $this->reportUpstreamLost(1);
+        }
+    }
+
+    /** Something outside the contract threw while recording (a caller's `clock`, say). */
+    private function reportUpstreamFailure(\Throwable $e): void
+    {
+        $this->report(new LoggerErrorEvent(
+            LoggerErrorEvent::REASON_INVALID_ENTRY,
+            'logger.upstream(): call could not be recorded: ' . $e->getMessage(),
+            0,
+            $this->droppedTotal,
+            null,
+            null,
+            null,
+            $e,
+        ));
+    }
+
+    /** Marks the active scope a request (it logs a request or response line). */
+    private function markRequest(): RequestScope
+    {
+        $scope = $this->activeScope();
+        if ($scope !== $this->rootScope && !$scope->isRequest) {
+            $scope->isRequest = true;
+            // Its calls ship on its own line now: nothing above may pull them.
+            if ($scope->host !== null) {
+                unset($scope->host->helpers[spl_object_id($scope)]);
+            }
+        }
+
+        return $scope;
+    }
+
+    /**
+     * The trail `logResponse()` ships: the responding scope's own — its
+     * pre-flight calls included — plus whatever its non-request nested scopes
+     * are holding (pulled first), cleared so the scope keeps collecting for
+     * its next response.
+     *
+     * @return array{calls: list<array<string, mixed>>, dropped: int}|null
+     */
+    private function responseTrail(): ?array
+    {
+        $scope = $this->markRequest();
+        if ($scope === $this->rootScope) {
+            $this->rootResponses++;
+            return $scope->trail->take();
+        }
+        $this->pullHelpers($scope);
+        $scope->midExchange = false;
+
+        return $scope->trail->take();
+    }
+
+    /**
+     * Once per logger: a call landed on the logger-wide trail of a logger
+     * that has ALREADY shipped a logger-wide response.
+     *
+     * The spec asks for a one-time warning whenever a call is held
+     * logger-wide, because on a concurrent server it ships on whichever
+     * request responds next. The TypeScript SDK warns on the first such call.
+     * In PHP that is the normal, conformant case — one request per PHP-FPM
+     * process — so warning there would put a line in every FPM request's
+     * error log. A second logger-wide response is what shows this logger
+     * outlives its request (an Octane singleton, a queue worker), which is
+     * exactly when an unanswered request's calls can land on the next one's
+     * line. That is when this warns.
+     */
+    private function reportRootUpstream(): void
+    {
+        if ($this->reportedRootUpstream || $this->rootResponses === 0) {
+            return;
+        }
+        $this->reportedRootUpstream = true;
+        $this->report(new LoggerErrorEvent(
+            LoggerErrorEvent::REASON_INVALID_ENTRY,
+            'logger.upstream() / upstreamMiddleware recorded a call outside any request scope on a logger that has already logged a response — it is held on the logger-wide trail (at most 20) and ships on the next logResponse made outside a scope, from whichever request that is. On a long-running worker (Octane, RoadRunner, Swoole, a queue worker), record calls inside a request scope (runWithContext / child); safe to ignore if each request runs in its own process',
+            0,
+            $this->droppedTotal,
+        ));
     }
 
     /**
@@ -373,6 +988,9 @@ class Logger
      */
     public function logRequest(string $apiKey, array $request): string
     {
+        // PAPI-5337: this scope is now a request, mid-exchange until it
+        // responds — scopes opened under it from here belong to its response.
+        $this->markRequest()->midExchange = true;
         $headers = $request['headers'] ?? [];
         $correlationId = $headers['x-correlation-id'] ?? Uuid::uuid4()->toString();
 
@@ -439,6 +1057,19 @@ class Logger
             return;
         }
 
+        // PAPI-5337: the request's upstream trail rides on this line and no
+        // other, and is cleared here whether or not the line is then
+        // delivered. No calls → no `upstream` key: the line is byte-identical
+        // to one from an SDK without the trail.
+        $trail = $this->responseTrail();
+        if ($trail !== null) {
+            $data['upstream'] = $trail['calls'];
+            if ($trail['dropped'] > 0) {
+                $data['_upstreamTruncated'] = true;
+                $data['_upstreamDropped'] = $trail['dropped'];
+            }
+        }
+
         $this->info($apiKey, 'Outgoing response', $data);
     }
 
@@ -459,6 +1090,14 @@ class Logger
      */
     public function flush(): void
     {
+        // PAPI-5337: dropped upstream calls the rate limit held back are
+        // reported now, so a burst is never left unreported at the end of a
+        // request. (The `batchSize` drain does not come through here.)
+        try {
+            $this->reportUnreportedUpstreamLost();
+        } catch (\Throwable) {
+            // A caller-supplied `clock` that throws; flush() never throws.
+        }
         $this->drain(self::DRAIN_FULL);
     }
 
@@ -648,7 +1287,11 @@ class Logger
     /**
      * Buffer counters — how much is waiting, delivered and lost.
      *
-     * @return array{buffered: int, delivered: int, dropped: int}
+     * `upstreamDropped` counts upstream calls (PAPI-5337) dropped because no
+     * response line was left to ship them on — every one, including those a
+     * rate-limited `onError` report has not mentioned yet.
+     *
+     * @return array{buffered: int, delivered: int, dropped: int, upstreamDropped: int}
      */
     public function stats(): array
     {
@@ -656,6 +1299,7 @@ class Logger
             'buffered' => count($this->buffer),
             'delivered' => $this->deliveredTotal,
             'dropped' => $this->droppedTotal,
+            'upstreamDropped' => $this->upstreamLostTotal,
         ];
     }
 
@@ -840,18 +1484,23 @@ class Logger
         $timestampMs = ($this->timestampProvider)();
         $timestampNs = bcmul((string) $timestampMs, '1000000');
 
+        // Resolved once, so every field on this entry comes from the same
+        // scope (PAPI-5336) — the request's own inside a scope, else the
+        // logger-wide context.
+        $context = $this->activeScope()->context;
+
         $contextDefaults = array_filter([
-            'request_id' => $this->context['requestId'] ?? null,
-            'path' => $this->context['path'] ?? null,
-            'method' => $this->context['method'] ?? null,
-            'status_code' => $this->context['statusCode'] ?? null,
-            'duration_ms' => $this->context['duration'] ?? null,
-            'correlation_id' => $this->context['correlationId'] ?? null,
+            'request_id' => $context['requestId'] ?? null,
+            'path' => $context['path'] ?? null,
+            'method' => $context['method'] ?? null,
+            'status_code' => $context['statusCode'] ?? null,
+            'duration_ms' => $context['duration'] ?? null,
+            'correlation_id' => $context['correlationId'] ?? null,
         ], fn ($v) => $v !== null);
 
         $lineBase = ['level' => $level, 'message' => $message];
-        if (($this->context['partnerId'] ?? null) !== null) {
-            $lineBase['partnerId'] = $this->context['partnerId'];
+        if (($context['partnerId'] ?? null) !== null) {
+            $lineBase['partnerId'] = $context['partnerId'];
         }
 
         // Merge context defaults (nulls already filtered) then user data (preserve nulls)
@@ -860,7 +1509,7 @@ class Logger
         // `$data` is whatever the caller passed. Invalid UTF-8 or a recursive
         // structure makes `json_encode` return false — which, before 2.0.0,
         // shipped a literal `false` as the log line.
-        $line = json_encode($lineData, JSON_UNESCAPED_SLASHES);
+        $line = json_encode($lineData, self::LINE_JSON_FLAGS);
         if ($line === false) {
             $this->reject('Failed to send log: log entry could not be serialised: ' . json_last_error_msg());
             return null;
@@ -869,23 +1518,23 @@ class Logger
         // Labels and upstream attribution are snapshotted here, not at drain
         // time — a later `setContext` must not retro-label queued entries.
         $labels = ['level' => $level];
-        if (isset($this->context['partnerId'])) {
-            $labels['partnerId'] = $this->context['partnerId'];
+        if (isset($context['partnerId'])) {
+            $labels['partnerId'] = $context['partnerId'];
         }
         // PAPI-687: direction rides in labels so ingest can promote it to a
         // Loki stream label. Omitted when unset — ingest defaults to 'inbound'.
-        if (isset($this->context['direction'])) {
-            $labels['direction'] = $this->context['direction'];
+        if (isset($context['direction'])) {
+            $labels['direction'] = $context['direction'];
         }
 
         // PAPI-687: upstream attribution is request-level, not a stream label
         // (base URLs are high-cardinality). Ingest folds these into the line.
         $root = [];
-        if (isset($this->context['upstreamIntegration'])) {
-            $root['upstream_integration'] = $this->context['upstreamIntegration'];
+        if (isset($context['upstreamIntegration'])) {
+            $root['upstream_integration'] = $context['upstreamIntegration'];
         }
-        if (isset($this->context['upstreamBaseUrl'])) {
-            $root['upstream_base_url'] = $this->context['upstreamBaseUrl'];
+        if (isset($context['upstreamBaseUrl'])) {
+            $root['upstream_base_url'] = $context['upstreamBaseUrl'];
         }
 
         return [
@@ -915,11 +1564,18 @@ class Logger
         ));
     }
 
-    /** Hands an error to the caller's hook without letting it escape. */
+    /**
+     * Hands an error to the caller's hook without letting it escape.
+     *
+     * Logger-internal events are logger-wide (PAPI-5336, rule 4): the hook
+     * runs at the root scope, so a hook that logs on this logger writes a
+     * logger-wide line, never one stamped with the request that happened to
+     * trigger the report.
+     */
     private function report(LoggerErrorEvent $event): void
     {
         try {
-            ($this->onError)($event);
+            $this->atRootScope(fn () => ($this->onError)($event));
         } catch (\Throwable) {
             // A broken hook is not worth breaking the caller's request over.
         }
@@ -952,7 +1608,10 @@ class Logger
             fastcgi_finish_request();
         }
 
-        $this->flush();
+        // Belongs to no request (PAPI-5336, rule 4) — and an `exit` inside
+        // runWithContext() skips the `finally` that would have closed its
+        // scope, so the stack may still name one here.
+        $this->atRootScope(fn () => $this->flush());
 
         // PHP runs shutdown functions in registration order, and this one is
         // armed on the FIRST log call — so anything the application registered
@@ -1176,6 +1835,9 @@ class Logger
     {
         $options = [
             'json' => $body,
+            // Never the caller's upstream call, even through a client that
+            // carries an upstreamMiddleware().
+            self::INTERNAL_REQUEST_OPTION => true,
             'headers' => [
                 'Content-Type' => 'application/json',
                 'x-api-key' => $apiKey,

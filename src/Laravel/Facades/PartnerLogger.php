@@ -18,7 +18,11 @@ use PartnerApi\Logger\Logger;
  * @method static void flush()
  * @method static void shutdown()
  * @method static void close()
- * @method static array{buffered: int, delivered: int, dropped: int} stats()
+ * @method static array{buffered: int, delivered: int, dropped: int, upstreamDropped: int} stats()
+ * @method static mixed runWithContext(array $context, callable $fn)
+ * @method static \PartnerApi\Logger\Logger child(array $context = [])
+ * @method static void upstream(array $call)
+ * @method static callable upstreamMiddleware(string $name, array $options = [])
  *
  * @see \PartnerApi\Logger\Logger
  */
