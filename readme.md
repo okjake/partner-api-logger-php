@@ -5,7 +5,7 @@
 Sends structured logs and metrics to the Partner API ingest service, or
 writes the logs to stdout for your own log pipeline to deliver
 ([Pipeline delivery](#pipeline-delivery-stdout-mode)). It mirrors
-`@partner-api/logger` 3.1.0; the cross-language contract is
+`@partner-api/logger` 3.2.0; the cross-language contract is
 `packages/logger-spec/spec.md`. Changes by version are in
 [CHANGELOG.md](CHANGELOG.md).
 

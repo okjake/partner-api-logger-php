@@ -72,7 +72,7 @@ A line looks like this (one line, shortened here):
    secret file. A line written under one token and sent under another matches
    no partner and is dropped.
 2. **The SDK in stdout mode.** Only the constructor changes:
-   - **TypeScript** (`@partner-api/logger`, the first release after 3.1.0):
+   - **TypeScript** (`@partner-api/logger` 3.2.0 or later):
 
      ```ts
      const logger = new Logger({
