@@ -91,8 +91,8 @@ $logger->setContext([
 
 Recognised keys are `partnerId`, `requestId`, `correlationId`, `path`,
 `method`, `statusCode` and `duration`, plus `direction` (`'inbound'` or
-`'outbound'`), `upstreamIntegration` and `upstreamBaseUrl` for calls to an
-upstream integration. Context is copied into an entry when it is buffered.
+`'outbound'`), `upstreamIntegration` and `upstreamBaseUrl` for calls your own
+code makes to a service it uses (an upstream integration). Context is copied into an entry when it is buffered.
 Outside a request scope it is logger-wide, which is right for PHP-FPM and the
 CLI.
 
@@ -175,6 +175,42 @@ $logger->logResponse($apiKey, [
   redacts personal data in bodies and replaces a log line over 250 KB with a
   marker that has no body (`docs/features/entity-view.md` § Projection
   fidelity limits).
+
+## Logging webhooks
+
+**Incoming webhooks**, a partner calling a webhook endpoint of yours, are
+ordinary inbound traffic: log them with `logRequest()` / `logResponse()` like
+any other partner request.
+
+What differs is how you know the partner. A webhook is usually authenticated
+by a signature rather than by the partner's app key. Once your handler has
+verified the signature and knows which partner sent it, pass **that
+partner's app key** to the log calls. Do not leave a webhook out of your logs
+because it carries no key, and do not log it under another partner's key: a partner sees only the
+lines attributed to it.
+
+```php
+// After verifying the signature and finding the partner that sent it:
+$apiKey = $appKeys->forPartner($partnerId); // your own mapping
+$correlationId = $logger->logRequest($apiKey, [
+    'method' => $request->method(),
+    'path' => $request->path(),
+    'headers' => [
+        'content-type' => $request->header('content-type'),
+        'x-signature' => '[REDACTED]',
+    ],
+    'body' => $request->json()->all(),
+]);
+```
+
+Never log the signing secret, and replace the signature header's value
+yourself, as above: the SDK redacts only `authorization`, `cookie`,
+`set-cookie`, `x-api-key`, `x-tenant-token`, `proxy-authorization` and, in stdout mode, a header whose value equals the app key, so a header such as `x-signature` or
+`stripe-signature` is logged as given.
+
+**Outgoing webhooks**, your code delivering an event to a partner's endpoint:
+Partner API does not yet show webhook deliveries to partners. An outbound line
+is a call to a service you use and is never shown to a partner.
 
 ## Upstream call trail
 
@@ -534,6 +570,11 @@ as one JSON line to stdout instead of sending it, and your collector forwards
 the lines to Partner API over OTLP/HTTP. Nothing else changes: the same calls,
 the same facade, context, request scopes and upstream trail.
 
+**Setting up the collector:** the [pipeline guide](docs/pipeline-collectors.md)
+has tested configurations for the OpenTelemetry Collector, Fluent Bit and
+Vector, troubleshooting, the limits, and the line format for writing lines
+without the SDK.
+
 **Choose it** when your services already log to stdout at volume and you do
 not want a second shipper inside the process, with its own buffer, retries
 and egress. **Stay on the default** (push) for small or serverless
@@ -570,11 +611,11 @@ $logger->info($apiKey, 'Order created', ['orderId' => 42]);
   reference is keyed on it, so a line written under another token matches no
   partner and is dropped at ingest, where it is counted; the SDK cannot see
   it.
-- **Rolling the tenant token.** Lines written under the previous token keep
-  resolving for 7 days after the roll, so a collector's backlog and an app not
-  yet redeployed are not lost. The previous token itself stops authenticating
-  at once: update the collector's header when you roll, and redeploy the app
-  within the week.
+- **Rolling the tenant token.** The old token stops working at once. Lines
+  your app wrote under it, including any still waiting in your collector,
+  match no partner once the token has changed: they are dropped and reported
+  to the collector as `unmatched`. Roll in a quiet period, and redeploy the
+  app and the collector with the new token in the same change.
 - **Bodies and data travel through your pipeline as you pass them.** The SDK
   redacts the sensitive headers listed under
   [Request and response logging](#request-and-response-logging), and also any
@@ -587,8 +628,14 @@ $logger->info($apiKey, 'Order created', ['orderId' => 42]);
 - **Strip the container wrapper first.** Container runtimes wrap each line
   (CRI: `<time> stdout F …`; Docker's json-file driver: `{"log":"…"}`) and
   split lines over 16 KiB. Your collector must unwrap and reassemble them
-  (the OpenTelemetry Collector's filelog receiver has a `container` operator
-  for this) before it filters on the prefix, or nothing matches.
+  before it filters on the prefix, or nothing matches. The OpenTelemetry
+  Collector's `file_log` receiver has a `container` operator that removes
+  either wrapper but rejoins only CRI (Kubernetes) partial lines: each file's
+  separately only with `include_file_path: true`, and intact only with
+  `preserve_trailing_whitespaces: true`. Docker json-file partial lines need a
+  `recombine` operator. Neither separates stdout from stderr, so drop stderr
+  before rejoining, and keep the SDK's lines on stdout. The [pipeline guide](docs/pipeline-collectors.md) has
+  a tested configuration for each runtime. A file sink needs none of this.
 - **A log call never touches the network.** No buffer, batching, retries or
   end-of-request drain; `flush()`, `shutdown()` and `close()` only flush the
   stream. `metric()` / `metrics()` still post to ingest as before.
@@ -617,6 +664,8 @@ $logger->info($apiKey, 'Order created', ['orderId' => 42]);
   name. Anything else (`php://output`, which under PHP-FPM would write your
   log lines into the HTTP response, `php://memory`, `php://temp`, `http://`,
   `phar://`, …) throws `LoggerException` at construction.
+  Lines written to `'php://stderr'` are dropped by the guide's Kubernetes and
+  Docker collector configurations, which forward stdout only.
 - an open, writable **stream resource**, which the logger never closes;
 - a **callable** that receives each complete line, trailing `"\n"` included,
   once per line.
