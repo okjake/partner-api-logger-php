@@ -8,8 +8,22 @@ return [
     // drains them after the response has been sent, so an ingest outage can
     // never fail or slow down the request being logged. 'direct' restores the
     // pre-2.0 behaviour: every log call POSTs synchronously and throws
-    // PartnerApi\Logger\LoggerException on failure.
+    // PartnerApi\Logger\LoggerException on failure. 'stdout' writes each log
+    // call as one JSON line to stdout_sink for your own log pipeline (an
+    // OpenTelemetry Collector, Fluent Bit, Vector) to deliver, and sends
+    // nothing itself; see the readme, "Pipeline delivery (stdout mode)".
     'mode' => env('PARTNER_API_LOG_MODE', 'buffered'),
+
+    // Where 'stdout' mode writes: php://stdout, php://stderr or an ABSOLUTE
+    // file path, opened in append mode (reopened when rotated away). Under
+    // PHP-FPM worker output is discarded unless the pool sets
+    // catch_workers_output, and then FPM splits lines longer than log_limit;
+    // under `octane:start` the server re-renders worker output and the lines
+    // lose their prefix. Under FPM or Octane, set this to a file your
+    // collector tails. See the readme, "PHP-FPM" and "Octane". Ignored in the
+    // other modes; in stdout mode any value that is not a non-empty string
+    // means php://stdout.
+    'stdout_sink' => env('PARTNER_API_LOG_STDOUT_SINK', 'php://stdout'),
 
     // Buffered entries that trigger an automatic drain mid-request. 0 disables
     // the size trigger, leaving exactly one POST at the end of the request.

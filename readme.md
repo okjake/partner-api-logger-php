@@ -2,8 +2,10 @@
 
 # Partner API Logger SDK for PHP
 
-Sends structured logs and metrics to the Partner API ingest service. It
-mirrors `@partner-api/logger` 3.1.0; the cross-language contract is
+Sends structured logs and metrics to the Partner API ingest service, or
+writes the logs to stdout for your own log pipeline to deliver
+([Pipeline delivery](#pipeline-delivery-stdout-mode)). It mirrors
+`@partner-api/logger` 3.1.0; the cross-language contract is
 `packages/logger-spec/spec.md`. Changes by version are in
 [CHANGELOG.md](CHANGELOG.md).
 
@@ -388,23 +390,25 @@ Metrics are not buffered: each call posts at once and throws
 The constructor takes `tenantToken`, then optional `baseUrl` (default
 `https://ingest.partnerapi.com`), `httpClient` (any Guzzle `ClientInterface`),
 `timestampProvider` (a callable returning epoch milliseconds) and `options`.
-Pass them by name. An unknown option or `mode` throws `LoggerException` at
+Pass them by name. An unknown option or `mode`, an unusable `stdoutSink`, and
+an empty `tenantToken` in stdout mode throw `LoggerException` at
 construction.
 
-| Option                    | Default                 | Laravel env (`PARTNER_API_LOG_*`) | Effect                                                                                                            |
-| ------------------------- | ----------------------- | --------------------------------- | ----------------------------------------------------------------------------------------------------------------- |
-| `mode`                    | `Logger::MODE_BUFFERED` | `MODE`                            | `Logger::MODE_DIRECT` posts on every log call, once, and throws `LoggerException` on failure                      |
-| `onError`                 | one `error_log()`       | none                              | Receives a `LoggerErrorEvent` for every drop                                                                      |
-| `batchSize`               | 100                     | `BATCH_SIZE`                      | Buffered entries that trigger a drain inside the log call; `0` leaves only `flush()` and the end-of-request drain |
-| `maxBufferSize`           | 1000                    | `MAX_BUFFER_SIZE`                 | Entries held before the oldest are dropped                                                                        |
-| `maxRetries`              | 3                       | `MAX_RETRIES`                     | Retries per batch on a network fault, 408, 429 or 5xx, in `flush()` and the end-of-request drain only             |
-| `retryBaseDelayMs`        | 200                     | `RETRY_BASE_DELAY_MS`             | First backoff window; it doubles per retry, with jitter                                                           |
-| `retryMaxDelayMs`         | 5000                    | `RETRY_MAX_DELAY_MS`              | Largest backoff window                                                                                            |
-| `requestTimeoutMs`        | 5000                    | `REQUEST_TIMEOUT_MS`              | Deadline for one POST, metrics included; `0` disables it                                                          |
-| `autoDrainTimeoutMs`      | 1000                    | `AUTO_DRAIN_TIMEOUT_MS`           | Budget for the drain in a log call, and on destroy; `0` disables it (on destroy, `requestTimeoutMs` per attempt)  |
-| `drainDeadlineMs`         | 5000                    | `DRAIN_DEADLINE_MS`               | Budget for one `flush()` or end-of-request drain, retries included; `0` disables it                               |
-| `flushOnShutdown`         | `true`                  | `FLUSH_ON_SHUTDOWN`               | Drain from a `register_shutdown_function`, and on a long-running worker when a logger is destroyed                |
-| `finishRequestOnShutdown` | `true`                  | `FINISH_REQUEST`                  | Call `fastcgi_finish_request()` before that drain                                                                 |
+| Option                    | Default                 | Laravel env (`PARTNER_API_LOG_*`) | Effect                                                                                                                                                                                                                     |
+| ------------------------- | ----------------------- | --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `mode`                    | `Logger::MODE_BUFFERED` | `MODE`                            | `Logger::MODE_DIRECT` posts on every log call, once, and throws `LoggerException` on failure; `Logger::MODE_STDOUT` writes each log call as one line to `stdoutSink` ([Pipeline delivery](#pipeline-delivery-stdout-mode)) |
+| `stdoutSink`              | `'php://stdout'`        | `STDOUT_SINK`                     | Where `MODE_STDOUT` writes: a stream URI or file path, an open stream, or a callable taking each line                                                                                                                      |
+| `onError`                 | one `error_log()`       | none                              | Receives a `LoggerErrorEvent` for every drop                                                                                                                                                                               |
+| `batchSize`               | 100                     | `BATCH_SIZE`                      | Buffered entries that trigger a drain inside the log call; `0` leaves only `flush()` and the end-of-request drain                                                                                                          |
+| `maxBufferSize`           | 1000                    | `MAX_BUFFER_SIZE`                 | Entries held before the oldest are dropped                                                                                                                                                                                 |
+| `maxRetries`              | 3                       | `MAX_RETRIES`                     | Retries per batch on a network fault, 408, 429 or 5xx, in `flush()` and the end-of-request drain only                                                                                                                      |
+| `retryBaseDelayMs`        | 200                     | `RETRY_BASE_DELAY_MS`             | First backoff window; it doubles per retry, with jitter                                                                                                                                                                    |
+| `retryMaxDelayMs`         | 5000                    | `RETRY_MAX_DELAY_MS`              | Largest backoff window                                                                                                                                                                                                     |
+| `requestTimeoutMs`        | 5000                    | `REQUEST_TIMEOUT_MS`              | Deadline for one POST, metrics included; `0` disables it                                                                                                                                                                   |
+| `autoDrainTimeoutMs`      | 1000                    | `AUTO_DRAIN_TIMEOUT_MS`           | Budget for the drain in a log call, and on destroy; `0` disables it (on destroy, `requestTimeoutMs` per attempt)                                                                                                           |
+| `drainDeadlineMs`         | 5000                    | `DRAIN_DEADLINE_MS`               | Budget for one `flush()` or end-of-request drain, retries included; `0` disables it                                                                                                                                        |
+| `flushOnShutdown`         | `true`                  | `FLUSH_ON_SHUTDOWN`               | Drain from a `register_shutdown_function`, and on a long-running worker when a logger is destroyed                                                                                                                         |
+| `finishRequestOnShutdown` | `true`                  | `FINISH_REQUEST`                  | Call `fastcgi_finish_request()` before that drain                                                                                                                                                                          |
 
 `batchSize` is capped at `maxBufferSize` and at 1000. Under Laravel each
 option is a snake_case key in `config/partner-logger.php`, read from the
@@ -507,6 +511,8 @@ $logger = new Logger(
 | `buffer-overflow` | `maxBufferSize` was reached and the oldest entries were dropped                                                                                |
 | `invalid-entry`   | The call itself was unusable: no API key, unserialisable data, a malformed request or response array; also a rejected or dropped upstream call |
 | `drain-timeout`   | `drainDeadlineMs` ran out and the rest was dropped                                                                                             |
+| `write-failed`    | Stdout mode only: the sink threw, could not be opened, or took less than the whole line. At most one a minute; `entryCount` is the lines lost  |
+| `sink-warning`    | Stdout mode only, once per logger: under PHP-FPM with `php://stdout` or `php://stderr` as the sink, which FPM discards or splits               |
 
 The event also carries `message`, `entryCount`, `droppedTotal`, and where they
 apply `status`, `attempts`, `retryable` and `cause`.
@@ -519,6 +525,166 @@ $logger->stats();
 ```
 
 `upstreamDropped` counts upstream calls dropped for want of a response line.
+
+## Pipeline delivery (stdout mode)
+
+If you already ship your logs through a pipeline of your own (an
+OpenTelemetry Collector, Fluent Bit, Vector), the SDK can write each log call
+as one JSON line to stdout instead of sending it, and your collector forwards
+the lines to Partner API over OTLP/HTTP. Nothing else changes: the same calls,
+the same facade, context, request scopes and upstream trail.
+
+**Choose it** when your services already log to stdout at volume and you do
+not want a second shipper inside the process, with its own buffer, retries
+and egress. **Stay on the default** (push) for small or serverless
+deployments, or wherever no collector runs: push needs nothing besides the
+SDK.
+
+Switch with configuration, not code:
+
+```env
+PARTNER_API_LOG_MODE=stdout
+```
+
+```php
+$logger = new Logger(
+    tenantToken: getenv('PARTNER_API_TENANT_TOKEN'),
+    options: ['mode' => Logger::MODE_STDOUT],
+);
+$logger->info($apiKey, 'Order created', ['orderId' => 42]);
+```
+
+```text
+{"partnerapi_line":"1.6.0","partnerapi_partner_ref":"v1:7167…c676","partnerapi_timestamp":"1700000000000000000","partnerapi_level":"info","level":"info","message":"Order created","orderId":42}
+```
+
+- **Every line starts with `{"partnerapi_line":`.** Have your collector
+  forward the lines that do to `POST https://ingest.partnerapi.com/v1/logs`
+  (OTLP/HTTP) with a static `x-tenant-token` header, and send everything else
+  wherever it already goes.
+- **The line names the partner by a reference, never by its key.**
+  `partnerapi_partner_ref` is `v1:` plus an HMAC of the app key's SHA-256,
+  keyed with your tenant token. `PartnerApi\Logger\PartnerReference::v1($tenantToken, $appKey)`
+  computes it if you write lines from your own logger.
+- **The tenant token in the SDK must be the one your collector sends.** The
+  reference is keyed on it, so a line written under another token matches no
+  partner and is dropped at ingest, where it is counted; the SDK cannot see
+  it.
+- **Rolling the tenant token.** Lines written under the previous token keep
+  resolving for 7 days after the roll, so a collector's backlog and an app not
+  yet redeployed are not lost. The previous token itself stops authenticating
+  at once: update the collector's header when you roll, and redeploy the app
+  within the week.
+- **Bodies and data travel through your pipeline as you pass them.** The SDK
+  redacts the sensitive headers listed under
+  [Request and response logging](#request-and-response-logging), and also any
+  header whose value is exactly the app key, whatever the header is called.
+  Everything else (request and response bodies, `data`, a key in a query
+  string or a body) reaches your collector, and your own log store if it keeps
+  these lines, unsanitised. Ingest redacts personal data when the line
+  arrives, as it does for push. A collector's line-size limit can also cut a
+  long body before it reaches ingest.
+- **Strip the container wrapper first.** Container runtimes wrap each line
+  (CRI: `<time> stdout F …`; Docker's json-file driver: `{"log":"…"}`) and
+  split lines over 16 KiB. Your collector must unwrap and reassemble them
+  (the OpenTelemetry Collector's filelog receiver has a `container` operator
+  for this) before it filters on the prefix, or nothing matches.
+- **A log call never touches the network.** No buffer, batching, retries or
+  end-of-request drain; `flush()`, `shutdown()` and `close()` only flush the
+  stream. `metric()` / `metrics()` still post to ingest as before.
+- **Errors.** A missing key or unserialisable data is reported to `onError`
+  as in push mode and nothing is written. A sink that fails is reported as
+  `write-failed` (`Failed to write log: …`, with the OS's error where there is
+  one), at most once a minute: each report carries the lines lost since the
+  last, `stats()['dropped']` counts every one, and `flush()` reports what the
+  minute held back. A line your `onError` logs while handling that failure is
+  counted but not reported again. What happens after the write (in your
+  collector, at ingest) never reaches the SDK. In `stats()`, `delivered`
+  counts lines written in full.
+- **Laravel:** the logger is built on its first use, so an empty
+  `PARTNER_API_TENANT_TOKEN` in stdout mode throws `LoggerException` from the
+  first `PartnerLogger::` call, not at boot.
+
+### Sinks
+
+`stdoutSink` takes:
+
+- a **stream or file path**: `'php://stdout'` (the default), `'php://stderr'`,
+  `'php://fd/<n>'`, a `file://` URI or a local file path, opened in append
+  mode on the first line and kept open. Use an absolute path: a relative one
+  resolves against the working directory, which differs between PHP-FPM,
+  `artisan` and a queue worker. A string is always a path, never a function
+  name. Anything else (`php://output`, which under PHP-FPM would write your
+  log lines into the HTTP response, `php://memory`, `php://temp`, `http://`,
+  `phar://`, …) throws `LoggerException` at construction.
+- an open, writable **stream resource**, which the logger never closes;
+- a **callable** that receives each complete line, trailing `"\n"` included,
+  once per line.
+
+Each line is a single `fwrite()` (or a single call), so lines from one process
+never interleave. An emitter cut short mid-line ends the fragment with one
+`"\n"`, so the next line keeps its prefix, and reports the line as lost
+(ingest drops the fragment as unparseable); the SDK does exactly that and
+does not retry. Between processes sharing one output, a pipe write is atomic
+only up to 4096 bytes on Linux, and a line with bodies is usually longer: give
+each process its own output, or a file. Appends to one shared file from
+several processes do not interleave on a local filesystem; on a network
+filesystem (NFS, EFS) they can, so use one file per process there.
+
+**Rotation.** A file sink stays open. At most once a second, the logger
+checks whether its path still names the file it is writing to. When the file
+was renamed or deleted (logrotate's default `create` mode), it opens the path
+afresh and switches over only if that open succeeds; until then it keeps
+writing to the file it has, reports nothing, and tries again a second later.
+Lines written before the switch land in the rotated file. `copytruncate` keeps
+the same file and needs no reopen.
+
+### PHP-FPM
+
+An FPM worker's stdout is not the container's stdout. FPM discards worker
+stdout and stderr unless the pool sets `catch_workers_output = yes`. With it,
+FPM writes worker output to its own error log, prefixes each line with
+`[pool www] child 12 said into stdout:` unless `decorate_workers_output = no`,
+and splits any line longer than `log_limit` (1024 bytes by default). The
+official Docker images set `catch_workers_output = yes`,
+`decorate_workers_output = no` and `log_limit = 8192`, and send that log to
+the master's stderr: there the lines appear on the container's **stderr**, not
+stdout, and are still split above 8192 bytes. A split line is lost at ingest.
+
+So under FPM, point the sink at a file your collector tails:
+
+```env
+PARTNER_API_LOG_MODE=stdout
+PARTNER_API_LOG_STDOUT_SINK=/var/log/app/partner-api.jsonl
+```
+
+A logger constructed under FPM with `php://stdout` or `php://stderr` as its
+sink reports one `sink-warning` to `onError` saying so: once per logger
+instance, not per line. Under FPM each request builds its own logger, so with
+the default hook that is one `error_log()` line per request.
+
+If you want one file per worker, build the logger in your own
+service provider with `getmypid()` in the path: a value computed in
+`config/partner-logger.php` is frozen by `php artisan config:cache`.
+
+### Octane and other long-running processes
+
+Under `php artisan octane:start` (Swoole, RoadRunner or FrankenPHP) your
+workers run as child processes of a server that re-renders what they print:
+a JSON line on a worker's stdout is decoded, re-encoded and printed behind a
+label, so it loses its prefix, and repeated stderr lines are merged. Neither
+reaches ingest, while `stats()` still counts the lines as written. **Under
+Octane the sink must be a file, by absolute path:**
+
+```env
+PARTNER_API_LOG_MODE=stdout
+PARTNER_API_LOG_STDOUT_SINK=/var/log/app/partner-api.jsonl
+```
+
+`php://stdout` is right only for a plain CLI process whose stdout is what your
+container runtime captures: `queue:work` run directly (not under Horizon), or
+a daemon of your own. If several such processes share one stdout, the pipe
+limit above applies.
 
 ## Testing
 

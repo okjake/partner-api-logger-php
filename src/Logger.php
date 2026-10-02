@@ -77,6 +77,14 @@ use Ramsey\Uuid\Uuid;
  * The pre-2.0 synchronous behaviour — POST on the call, raise on failure — is
  * still reachable with `['mode' => Logger::MODE_DIRECT]`.
  *
+ * **Stdout mode (PAPI-5498).** `['mode' => Logger::MODE_STDOUT]` selects the
+ * spec's **pipeline** profile: every log call writes one JSON line to a sink
+ * (the process's stdout by default) for the customer's own log pipeline to
+ * deliver, and performs no network I/O, no buffering and no retries. The
+ * line names its partner by {@see PartnerReference}, never by the app key.
+ * Context, request scopes and the upstream trail are unchanged; see
+ * {@see self::composeStdoutLine()}.
+ *
  * `metric()` / `metrics()` are deliberately NOT buffered: a metric submission
  * is an explicit write the caller is entitled to a receipt for, so it still
  * posts synchronously and still raises `LoggerException` on failure.
@@ -112,6 +120,83 @@ class Logger
 
     /** Log calls POST synchronously and raise `LoggerException` on failure. */
     public const MODE_DIRECT = 'direct';
+
+    /**
+     * Log calls write one spec-shaped JSON line to the `stdoutSink` and
+     * return; nothing is sent over the network (the spec's pipeline profile,
+     * PAPI-5498). `metric()` / `metrics()` still POST.
+     */
+    public const MODE_STDOUT = 'stdout';
+
+    /**
+     * The `partnerapi_line` marker on every stdout line: the spec version that
+     * defined the line shape. It changes only when the line shape does.
+     */
+    public const STDOUT_LINE_VERSION = '1.6.0';
+
+    /**
+     * `json_encode` flags for a stdout line. After the byte-exact prefix the
+     * line is compared by value, so escaping need not match any other SDK.
+     * `JSON_INVALID_UTF8_SUBSTITUTE` writes U+FFFD for invalid UTF-8 instead
+     * of failing the call (spec § Stdout line, "Encoding"). U+2028/U+2029
+     * stay escaped (no `JSON_UNESCAPED_LINE_TERMINATORS`), and a raw LF can
+     * never appear: `json_encode` always escapes control characters.
+     */
+    private const STDOUT_JSON_FLAGS = JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE | JSON_INVALID_UTF8_SUBSTITUTE;
+
+    /** Default `stdoutSink`: the process's standard output. */
+    private const DEFAULT_STDOUT_SINK = 'php://stdout';
+
+    /**
+     * Partner references cached per app key. A logger normally sees a handful
+     * of keys; the cache is cleared when it reaches this size, so a caller
+     * passing unbounded distinct keys cannot grow it without limit.
+     */
+    private const MAX_CACHED_REFERENCES = 256;
+
+    /**
+     * Context field → stdout line field, in the push line's order (spec
+     * § Logging). `partnerId` is handled beside `level` / `message`.
+     */
+    private const STDOUT_CONTEXT_FIELDS = [
+        'requestId' => 'request_id',
+        'path' => 'path',
+        'method' => 'method',
+        'statusCode' => 'status_code',
+        'duration' => 'duration_ms',
+        'correlationId' => 'correlation_id',
+    ];
+
+    /** Context field → stdout envelope key; omitted when unset or empty. */
+    private const STDOUT_ENVELOPE_FIELDS = [
+        'direction' => 'partnerapi_direction',
+        'upstreamIntegration' => 'partnerapi_upstream_integration',
+        'upstreamBaseUrl' => 'partnerapi_upstream_base_url',
+    ];
+
+    /** Data keys under this prefix are reserved for the envelope and dropped. */
+    private const STDOUT_RESERVED_PREFIX = 'partnerapi_';
+
+    /**
+     * How often a file-path sink checks whether its file was rotated away
+     * (renamed or deleted, then recreated). Once a second keeps the check — a
+     * `stat()` — off the per-line path under load, and a rotation is noticed
+     * within a second; lines written in that second land in the rotated file,
+     * which still exists and which a collector reading by fingerprint still
+     * reads.
+     */
+    private const SINK_ROTATION_CHECK_MS = 1000;
+
+    /**
+     * At most one `write-failed` report per this window, carrying every line
+     * lost since the last one; every loss is still counted in `stats()`. A
+     * closed stdout otherwise costs one report — one `error_log()` with the
+     * default hook — per log call.
+     */
+    private const WRITE_FAILED_REPORT_INTERVAL_MS = 60000;
+
+    /** The process's own standard streams, as a stdout sink names them. */
+    private const PROCESS_STDIO_SINKS = ['php://stdout', 'php://stderr', 'php://fd/1', 'php://fd/2'];
 
     /**
      * The ingest service rejects a `/logs` POST carrying more than this many
@@ -201,6 +286,7 @@ class Logger
         'sleeper',
         'randomizer',
         'clock',
+        'stdoutSink',
     ];
 
     private const SENSITIVE_HEADERS = [
@@ -274,6 +360,56 @@ class Logger
     private int $drainDeadlineMs;
     private bool $flushOnShutdown;
     private bool $finishRequestOnShutdown;
+
+    /**
+     * Stdout mode's sink, normalised from `stdoutSink`: exactly one of a
+     * callable, an open stream, or a URI/path opened on first write.
+     */
+    private ?\Closure $sinkCallable = null;
+
+    /** @var resource|null */
+    private $sinkStream = null;
+
+    private ?string $sinkUri = null;
+
+    /** Whether `$sinkUri` names a file (a plain path or `file://`), which may be rotated. */
+    private bool $sinkIsPath = false;
+
+    /** @var array{0: int, 1: int}|null (dev, inode) of the file the open path sink writes to. */
+    private ?array $sinkIdentity = null;
+
+    /** When the path sink last checked for rotation (this logger's clock, ms). */
+    private ?float $sinkCheckedAt = null;
+
+    /** @var array<string, string> App key → partner reference; see partnerReference(). */
+    private array $partnerReferences = [];
+
+    /**
+     * Re-entrancy guards for stdout mode, the counterpart of `$draining`: a
+     * callable sink that logs through this logger, or an `onError` hook that
+     * logs while the sink is failing, would otherwise recurse without bound.
+     *
+     * Keyed by execution context ({@see self::executionContext()}), not one
+     * flag for the logger: a sink write can suspend (a Fiber, a Swoole
+     * coroutine hook), and another request logging meanwhile is not
+     * re-entering anything.
+     *
+     * @var array<string, true>
+     */
+    private array $emittingIn = [];
+
+    /** @var array<string, true> */
+    private array $reportingWriteFailureIn = [];
+
+    /** Lines lost to the sink, in total and since the last report. */
+    private int $writeLostTotal = 0;
+    private int $writeLostUnreported = 0;
+    private ?float $writeLostReportedAt = null;
+    private string $lastWriteFailure = '';
+    private ?\Throwable $lastWriteFailureCause = null;
+
+    /** @var (\Closure(): int)|false|null Swoole's coroutine-id reader; false when absent. */
+    private static \Closure|false|null $coroutineId = null;
 
     /** @var list<array{apiKey: string, labels: array<string, string>, root: array<string, string>, entry: array{timestamp: string, line: string}}> */
     private array $buffer = [];
@@ -361,10 +497,24 @@ class Logger
      *     finishRequestOnShutdown?: bool,
      *     sleeper?: callable(int): void,
      *     randomizer?: callable(): float,
-     *     clock?: callable(): float
+     *     clock?: callable(): float,
+     *     stdoutSink?: string|resource|callable(string): void
      * } $options
      *
-     * - `mode` — `Logger::MODE_BUFFERED` (default) or `Logger::MODE_DIRECT`.
+     * - `mode` — `Logger::MODE_BUFFERED` (default), `Logger::MODE_DIRECT` or
+     *   `Logger::MODE_STDOUT`.
+     * - `stdoutSink` — where `MODE_STDOUT` writes each line (ignored in the
+     *   other modes). Default `'php://stdout'`. One of:
+     *   - a **string**: a stream URI or file path (`'php://stderr'`,
+     *     `'/var/log/app/partner-api.log'`), opened in append mode on the
+     *     first line and kept open. A string is always a path, never a
+     *     function name.
+     *   - an open, writable **stream resource**. The logger never closes it.
+     *   - a **callable** receiving each complete line, trailing `"\n"`
+     *     included, once per line. Its return value is ignored.
+     *   Each line is one `fwrite()` (or one call). A sink that throws, cannot
+     *   be opened, or takes fewer bytes than the line is reported to
+     *   `onError` as `write-failed`; the log call never throws.
      * - `onError` — receives a {@see LoggerErrorEvent} for every drop. Defaults
      *   to one `error_log()` of the message, which is what the direct profile
      *   wrote to stderr. Throwing from the hook is swallowed.
@@ -441,15 +591,42 @@ class Logger
         // would leave a consumer that asked for the 1.x profile quietly on the
         // new one, catching nothing where it expects to catch.
         $mode = $options['mode'] ?? self::MODE_BUFFERED;
-        if ($mode !== self::MODE_BUFFERED && $mode !== self::MODE_DIRECT) {
+        if ($mode !== self::MODE_BUFFERED && $mode !== self::MODE_DIRECT && $mode !== self::MODE_STDOUT) {
             throw new LoggerException(sprintf(
-                'Unknown Logger mode: %s. Known modes: %s, %s',
+                'Unknown Logger mode: %s. Known modes: %s, %s, %s',
                 is_scalar($mode) ? (string) $mode : get_debug_type($mode),
                 self::MODE_BUFFERED,
                 self::MODE_DIRECT,
+                self::MODE_STDOUT,
             ));
         }
         $this->mode = $mode;
+
+        // Every stdout line's reference is keyed on the token: an empty one
+        // would write lines that match no partner, silently, at ingest.
+        if ($mode === self::MODE_STDOUT && $tenantToken === '') {
+            throw new LoggerException(
+                'Logger mode stdout needs tenantToken: the partner reference on every line is derived from it,'
+                . ' and it must be the token your collector sends to ingest'
+            );
+        }
+
+        // Validated in every mode, so a bad value is caught at construction
+        // when the deployment is switched to stdout, not on the first line.
+        $sink = $options['stdoutSink'] ?? self::DEFAULT_STDOUT_SINK;
+        if (is_string($sink)) {
+            $this->sinkIsPath = self::validateSinkUri($sink);
+            $this->sinkUri = $sink;
+        } elseif (is_resource($sink) && get_resource_type($sink) === 'stream') {
+            $this->sinkStream = $sink;
+        } elseif (is_callable($sink)) {
+            $this->sinkCallable = \Closure::fromCallable($sink);
+        } else {
+            throw new LoggerException(
+                'Logger option stdoutSink must be a stream URI or file path, an open stream resource,'
+                . ' or a callable receiving each line; got ' . get_debug_type($sink)
+            );
+        }
 
         $this->onError = $options['onError'] ?? static function (LoggerErrorEvent $event): void {
             error_log($event->message);
@@ -490,6 +667,83 @@ class Logger
         // hrtime() is monotonic: a drain budget must not be moved by an NTP
         // step or a leap second the way microtime() can be.
         $this->clock = $options['clock'] ?? static fn (): float => hrtime(true) / 1e6;
+
+        // Last: report() needs the hook and the scope state set above.
+        if (
+            $mode === self::MODE_STDOUT
+            && $this->sinkUri !== null
+            && in_array(strtolower($this->sinkUri), self::PROCESS_STDIO_SINKS, true)
+            && (self::$sapi ?? PHP_SAPI) === 'fpm-fcgi'
+        ) {
+            $this->report(new LoggerErrorEvent(
+                LoggerErrorEvent::REASON_SINK_WARNING,
+                "Logger mode stdout is writing to {$this->sinkUri} under PHP-FPM, which discards worker output"
+                . ' unless the pool sets catch_workers_output = yes, and then splits every line longer than'
+                . ' log_limit. Set stdoutSink to a file your collector reads.',
+                0,
+                0,
+            ));
+        }
+    }
+
+    /**
+     * Checks a string `stdoutSink` and says whether it is a file path (which
+     * may be rotated) rather than a process stream.
+     *
+     * Only sinks that end up in a log stream are accepted: the process's own
+     * stdout / stderr / descriptors, and local files. `php://output` would
+     * write log lines — bodies, headers — into the HTTP response under
+     * PHP-FPM; `php://input` cannot be written; `php://memory` / `php://temp`
+     * keep the lines in the process; and a network or archive wrapper
+     * (`http://`, `ftp://`, `phar://`, `data:`) is not a log sink.
+     */
+    private static function validateSinkUri(string $sink): bool
+    {
+        if ($sink === '') {
+            throw new LoggerException('Logger option stdoutSink must not be an empty string');
+        }
+
+        $allowed = 'php://stdout, php://stderr, php://fd/<n>, a file:// URI or a local file path';
+        if (preg_match('~^([a-zA-Z][a-zA-Z0-9+.\-]*)://(.*)\z~s', $sink, $m) === 1) {
+            $scheme = strtolower($m[1]);
+            if ($scheme === 'file') {
+                return true;
+            }
+            // PHP matches php:// targets case-insensitively.
+            if ($scheme === 'php' && preg_match('~^(?:stdout|stderr|fd/[0-9]+)\z~i', $m[2]) === 1) {
+                return false;
+            }
+            $why = $scheme === 'php' && strtolower($m[2]) === 'output'
+                ? ' (under PHP-FPM it would write log lines into the HTTP response)'
+                : '';
+            throw new LoggerException("Logger option stdoutSink {$sink} is not a log sink{$why}: use {$allowed}");
+        }
+        if (preg_match('~^data:~i', $sink) === 1) {
+            throw new LoggerException("Logger option stdoutSink {$sink} is not a log sink: use {$allowed}");
+        }
+
+        return true;
+    }
+
+    /**
+     * Never prints the tenant token, nor the raw app keys this logger holds
+     * as reference-cache keys (`var_dump()`, `print_r()`, and any dumper
+     * that honours `__debugInfo()`). Safe on an object whose constructor
+     * never ran.
+     *
+     * @return array<string, mixed>
+     */
+    public function __debugInfo(): array
+    {
+        return [
+            'mode' => $this->mode ?? null,
+            'baseUrl' => $this->baseUrl ?? null,
+            'tenantToken' => '[REDACTED]',
+            'stdoutSink' => $this->sinkUri
+                ?? ($this->sinkCallable !== null ? 'callable' : ($this->sinkStream !== null ? 'stream resource' : null)),
+            'cachedPartnerReferences' => count($this->partnerReferences),
+            'stats' => $this->stats(),
+        ];
     }
 
     /**
@@ -1102,15 +1356,19 @@ class Logger
                 'duration' => null,
             ]);
 
-            $data = [
-                'method' => $request['method'],
-                'path' => $request['path'],
-                'headers' => $this->redactHeaders($headers),
-                'correlation_id' => $correlationId,
-            ];
+            if ($this->mode === self::MODE_STDOUT) {
+                $data = $this->stdoutRequestData($apiKey, $request, $correlationId);
+            } else {
+                $data = [
+                    'method' => $request['method'],
+                    'path' => $request['path'],
+                    'headers' => $this->redactHeaders($headers),
+                    'correlation_id' => $correlationId,
+                ];
 
-            if (array_key_exists('body', $request)) {
-                $data['body'] = $request['body'];
+                if (array_key_exists('body', $request)) {
+                    $data['body'] = $request['body'];
+                }
             }
         } catch (\Throwable $e) {
             $this->reject('Failed to send log: request could not be described: ' . $e->getMessage());
@@ -1138,13 +1396,15 @@ class Logger
                 'duration' => $response['duration'],
             ]);
 
-            $data = [
-                'status_code' => $response['statusCode'],
-                'headers' => isset($response['headers']) ? $this->redactHeaders($response['headers']) : null,
-                'body' => $response['body'] ?? null,
-                'duration_ms' => $response['duration'],
-                'correlation_id' => $response['correlationId'],
-            ];
+            $data = $this->mode === self::MODE_STDOUT
+                ? $this->stdoutResponseData($apiKey, $response)
+                : [
+                    'status_code' => $response['statusCode'],
+                    'headers' => isset($response['headers']) ? $this->redactHeaders($response['headers']) : null,
+                    'body' => $response['body'] ?? null,
+                    'duration_ms' => $response['duration'],
+                    'correlation_id' => $response['correlationId'],
+                ];
         } catch (\Throwable $e) {
             // The exchange still answered: end it and clear its trail, as a
             // delivered response would. The calls are lost with the line,
@@ -1207,6 +1467,14 @@ class Logger
             $this->reportUnreportedUpstreamLost();
         } catch (\Throwable) {
             // A caller-supplied `clock` that throws; flush() never throws.
+        }
+        if ($this->mode === self::MODE_STDOUT) {
+            // Nothing is buffered in stdout mode: each line was written by its
+            // log call. Flushing the stream, and reporting write failures the
+            // rate limit held back, is all there is to do.
+            $this->flushSink();
+            $this->reportUnreportedWriteFailures();
+            return;
         }
         $this->drain(self::DRAIN_FULL, $startedAtMs);
     }
@@ -1443,6 +1711,10 @@ class Logger
      * response line was left to ship them on — every one, including those a
      * rate-limited `onError` report has not mentioned yet.
      *
+     * In stdout mode `buffered` is always 0 and `delivered` counts lines
+     * handed to the sink in full: what happens after the write (in the
+     * collector, at ingest) never reaches the SDK.
+     *
      * @return array{buffered: int, delivered: int, dropped: int, upstreamDropped: int}
      */
     public function stats(): array
@@ -1544,6 +1816,13 @@ class Logger
         if (empty($apiKey)) {
             // Wording is part of the cross-language contract (logger-spec).
             $this->reject('API key is required for logging');
+            return;
+        }
+
+        if ($this->mode === self::MODE_STDOUT) {
+            // No buffer, no batching, no retries, no shutdown drain: the line
+            // is written now or reported.
+            $this->writeStdoutLine($apiKey, $level, $message, $data);
             return;
         }
 
@@ -1686,16 +1965,7 @@ class Logger
         $timestampMs = ($this->timestampProvider)();
         $timestampNs = self::nanosecondTimestamp($timestampMs);
         if ($timestampNs === null) {
-            $this->reject(
-                'Failed to send log: log entry could not be built: timestampProvider must return'
-                . ' epoch milliseconds as an int, float, numeric string or Stringable, got '
-                . match (true) {
-                    // The cast is what was parsed, so it is what explains the rejection.
-                    is_float($timestampMs) => 'float ' . $timestampMs,
-                    is_string($timestampMs) => 'non-numeric string',
-                    default => get_debug_type($timestampMs),
-                }
-            );
+            $this->reject(self::badTimestampMessage($timestampMs));
             return null;
         }
 
@@ -1758,6 +2028,523 @@ class Logger
             'root' => $root,
             'entry' => ['timestamp' => $timestampNs, 'line' => $line],
         ];
+    }
+
+    /** Why a `timestampProvider` value was rejected; same text in every mode. */
+    private static function badTimestampMessage(mixed $timestampMs): string
+    {
+        return 'Failed to send log: log entry could not be built: timestampProvider must return'
+            . ' epoch milliseconds as an int, float, numeric string or Stringable, got '
+            . match (true) {
+                // The cast is what was parsed, so it is what explains the rejection.
+                is_float($timestampMs) => 'float ' . $timestampMs,
+                is_string($timestampMs) => 'non-numeric string',
+                default => get_debug_type($timestampMs),
+            };
+    }
+
+    /**
+     * Stdout mode: builds the line and hands it to the sink, or reports why
+     * not. Never throws — the same guard as buildEntry(), since everything
+     * here runs over the caller's values on the caller's request path.
+     *
+     * @param array<mixed> $data
+     */
+    private function writeStdoutLine(string $apiKey, string $level, string $message, array $data): void
+    {
+        try {
+            $line = $this->composeStdoutLine($apiKey, $level, $message, $data);
+        } catch (\Throwable $e) {
+            $this->reject('Failed to send log: log entry could not be built: ' . $e->getMessage());
+            return;
+        }
+
+        if ($line !== null) {
+            $this->emitStdoutLine($line);
+        }
+    }
+
+    /**
+     * One stdout line (spec § Pipeline profile, "Stdout line"): the envelope,
+     * then the line fields, then exactly one `"\n"` — or null after reporting
+     * why it could not be built.
+     *
+     * The envelope and the line object are serialised SEPARATELY and the two
+     * texts joined, so nothing in the caller's data can move ahead of
+     * `partnerapi_line`: the line keeps the byte-exact prefix
+     * `{"partnerapi_line":"1.6.0",` that collectors route on.
+     *
+     * The line object is built by plain key assignment — array_replace()
+     * semantics — and NEVER `array_merge()`, which renumbers integer keys:
+     * caller data `['2024' => 'x']` (PHP stores the key as int 2024) would be
+     * written as `"0":"x"`. Assignment keeps every key as given, lets data
+     * override a context field in place, and drops reserved keys in the same
+     * pass.
+     *
+     * @param array<mixed> $data
+     */
+    private function composeStdoutLine(string $apiKey, string $level, string $message, array $data): ?string
+    {
+        $timestampMs = ($this->timestampProvider)();
+        $timestampNs = self::nanosecondTimestamp($timestampMs);
+        if ($timestampNs === null) {
+            $this->reject(self::badTimestampMessage($timestampMs));
+            return null;
+        }
+
+        // Resolved once, so every field comes from the same scope (PAPI-5336).
+        $context = $this->activeScope()->context;
+
+        $envelope = [
+            'partnerapi_line' => self::STDOUT_LINE_VERSION,
+            'partnerapi_partner_ref' => $this->partnerReference($apiKey),
+            'partnerapi_timestamp' => $timestampNs,
+            // The CALL's level — the push path's `labels.level`. The line's
+            // own `level` below is data the caller may override.
+            'partnerapi_level' => $level,
+        ];
+        foreach (self::STDOUT_ENVELOPE_FIELDS as $field => $key) {
+            $value = $context[$field] ?? null;
+            if ($value !== null && $value !== '') {
+                $envelope[$key] = $value;
+            }
+        }
+
+        // Unset context fields (absent or null) are omitted; caller data is
+        // written as given, null included.
+        $line = ['level' => $level, 'message' => $message];
+        if (($context['partnerId'] ?? null) !== null) {
+            $line['partnerId'] = $context['partnerId'];
+        }
+        foreach (self::STDOUT_CONTEXT_FIELDS as $field => $key) {
+            if (($context[$field] ?? null) !== null) {
+                $line[$key] = $context[$field];
+            }
+        }
+        foreach ($data as $key => $value) {
+            // The envelope prefix is reserved at the top level: a caller can
+            // neither overwrite the reference or marker nor add envelope keys.
+            if (is_string($key) && str_starts_with($key, self::STDOUT_RESERVED_PREFIX)) {
+                continue;
+            }
+            $line[$key] = $value;
+        }
+
+        $envelopeJson = json_encode($envelope, self::STDOUT_JSON_FLAGS);
+        if ($envelopeJson === false) {
+            $this->reject('Failed to send log: log entry could not be serialised: ' . json_last_error_msg());
+            return null;
+        }
+        $lineJson = json_encode($line, self::STDOUT_JSON_FLAGS);
+        if ($lineJson === false) {
+            $this->reject('Failed to send log: log entry could not be serialised: ' . json_last_error_msg());
+            return null;
+        }
+        // `$line` always holds the string keys `level` and `message`, so it
+        // encodes as a non-empty object; anything else would corrupt the join.
+        if (!str_starts_with($lineJson, '{"')) {
+            throw new \UnexpectedValueException('line fields did not encode as a JSON object');
+        }
+
+        return substr($envelopeJson, 0, -1) . ',' . substr($lineJson, 1) . "\n";
+    }
+
+    /** The v1 partner reference for `$apiKey` under this logger's token, cached. */
+    private function partnerReference(string $apiKey): string
+    {
+        if (isset($this->partnerReferences[$apiKey])) {
+            return $this->partnerReferences[$apiKey];
+        }
+        if (count($this->partnerReferences) >= self::MAX_CACHED_REFERENCES) {
+            $this->partnerReferences = [];
+        }
+
+        return $this->partnerReferences[$apiKey] = PartnerReference::v1($this->tenantToken, $apiKey);
+    }
+
+    /**
+     * Hands one complete line to the sink: ONE call, or ONE `fwrite()`, so
+     * lines from this process never interleave (spec: atomicity is per
+     * process).
+     *
+     * A short write is not retried. PHP's stream layer already keeps writing
+     * after a partial `write(2)` until the OS reports an error, so a short
+     * count means the sink failed mid-line, and a second write could not be
+     * atomic anyway. Instead one `"\n"` is attempted, so the fragment ends
+     * where it stopped and the NEXT line still starts with the marker prefix
+     * (ingest drops the fragment as `unparseable_line`). The line is reported
+     * as lost, with the OS's own error where PHP raised one.
+     */
+    private function emitStdoutLine(string $line): void
+    {
+        $context = self::executionContext();
+        if (isset($this->emittingIn[$context])) {
+            $this->writeFailed('the sink logged through the logger it is writing for', null);
+            return;
+        }
+        $this->emittingIn[$context] = true;
+
+        $failure = null;
+        $cause = null;
+        try {
+            if ($this->sinkCallable !== null) {
+                ($this->sinkCallable)($line);
+                $this->deliveredTotal++;
+            } else {
+                $stream = $this->sinkStream();
+                $length = strlen($line);
+                [$written, $error] = self::capturingErrors(static fn () => fwrite($stream, $line));
+                if ($written === $length) {
+                    $this->deliveredTotal++;
+                } else {
+                    if (is_int($written) && $written > 0) {
+                        self::capturingErrors(static fn () => fwrite($stream, "\n"));
+                    }
+                    $wrote = sprintf('wrote %d of %d bytes', is_int($written) ? $written : 0, $length);
+                    $failure = $error !== null ? "{$error} ({$wrote})" : $wrote;
+                }
+            }
+        } catch (\Throwable $e) {
+            $failure = $e->getMessage();
+            $cause = $e;
+        } finally {
+            unset($this->emittingIn[$context]);
+        }
+
+        // After the guard is released: an `onError` that logs a line about
+        // this failure is not the sink re-entering the logger.
+        if ($failure !== null) {
+            $this->writeFailed($failure, $cause);
+        }
+    }
+
+    /**
+     * Runs `$fn` with a temporary error handler that keeps the message of any
+     * warning it raises (the OS's EPIPE / ENOSPC text, from `fwrite()` /
+     * `fopen()`) instead of letting it reach the host's handler — which a
+     * framework would promote to an exception — and restores the previous
+     * handler whatever happens. Unlike `@` plus `error_get_last()`, this
+     * works under a framework's own handler and leaves the host's last-error
+     * state alone.
+     *
+     * @template T
+     * @param callable(): T $fn
+     * @return array{0: T, 1: string|null}
+     */
+    private static function capturingErrors(callable $fn): array
+    {
+        $error = null;
+        set_error_handler(static function (int $level, string $message) use (&$error): bool {
+            $error = $message;
+
+            return true;
+        });
+        try {
+            $result = $fn();
+        } finally {
+            restore_error_handler();
+        }
+
+        return [$result, $error];
+    }
+
+    /**
+     * Who is running right now, for the re-entrancy guards: the current
+     * Fiber, and the Swoole coroutine when that extension is loaded (it is
+     * optional, never required). Two requests interleaved by either are two
+     * contexts; a sink that logs through its own logger is the same one.
+     */
+    private static function executionContext(): string
+    {
+        $fiber = \Fiber::getCurrent();
+        $key = $fiber === null ? 'main' : 'fiber:' . spl_object_id($fiber);
+
+        if (self::$coroutineId === null) {
+            self::$coroutineId = false;
+            foreach (['Swoole\\Coroutine', 'OpenSwoole\\Coroutine'] as $class) {
+                if (class_exists($class, false) && is_callable([$class, 'getCid'])) {
+                    self::$coroutineId = \Closure::fromCallable([$class, 'getCid']);
+                    break;
+                }
+            }
+        }
+        if (self::$coroutineId !== false) {
+            $key .= ':co:' . (self::$coroutineId)();
+        }
+
+        return $key;
+    }
+
+    /**
+     * The stream behind a URI/path sink, opened in append mode on first use
+     * and kept open. A file-path sink switches to a fresh stream when its
+     * file was rotated away (see {@see self::SINK_ROTATION_CHECK_MS} and
+     * {@see self::reopenRotatedSink()}). Throws when the FIRST open fails;
+     * the next line tries again.
+     *
+     * @return resource
+     */
+    private function sinkStream()
+    {
+        if ($this->sinkStream !== null && $this->sinkIsPath && $this->sinkRotationDue() && $this->sinkMayHaveRotated()) {
+            $this->reopenRotatedSink();
+        }
+        if ($this->sinkStream !== null) {
+            return $this->sinkStream;
+        }
+
+        $uri = (string) $this->sinkUri;
+        [$stream, $error] = self::capturingErrors(static fn () => fopen($uri, 'ab'));
+        if ($stream === false) {
+            throw new \RuntimeException("could not open {$uri}: " . ($error ?? 'unknown error'));
+        }
+        if ($this->sinkIsPath) {
+            $this->sinkIdentity = self::streamIdentity($stream);
+            $this->sinkCheckedAt = $this->sinkClockMs();
+        }
+
+        return $this->sinkStream = $stream;
+    }
+
+    /** Whether a rotation check is due; at most once per SINK_ROTATION_CHECK_MS. */
+    private function sinkRotationDue(): bool
+    {
+        $now = $this->sinkClockMs();
+        if ($now === null || ($this->sinkCheckedAt !== null && $now - $this->sinkCheckedAt < self::SINK_ROTATION_CHECK_MS)) {
+            return false;
+        }
+        $this->sinkCheckedAt = $now;
+
+        return true;
+    }
+
+    /**
+     * Whether the path may no longer name the file the open stream writes
+     * to: `stat()` fails, or names another file (dev/inode). `copytruncate`
+     * keeps the same file, so it never gets this far.
+     *
+     * A failed `stat()` is only a candidate: PHP does not say why it failed,
+     * and an unreadable directory fails it as surely as a deleted file does.
+     * {@see self::reopenRotatedSink()} decides.
+     */
+    private function sinkMayHaveRotated(): bool
+    {
+        if ($this->sinkIdentity === null) {
+            return false;
+        }
+        $path = (string) $this->sinkUri;
+        clearstatcache(true, $path);
+        [$stat] = self::capturingErrors(static fn () => stat($path));
+
+        return $stat === false || [(int) $stat['dev'], (int) $stat['ino']] !== $this->sinkIdentity;
+    }
+
+    /**
+     * Opens the path afresh and switches to it only when that open succeeds
+     * AND names a different file than the one being written — the path was
+     * renamed or deleted away (logrotate's default `create` mode; a deleted
+     * path is recreated by the open). Otherwise the current stream, which
+     * still writes, is kept, nothing is reported (no line was lost), and the
+     * check runs again at the next interval: an unreadable directory, a new
+     * file that cannot be opened yet, a full inode table.
+     */
+    private function reopenRotatedSink(): void
+    {
+        $uri = (string) $this->sinkUri;
+        [$fresh] = self::capturingErrors(static fn () => fopen($uri, 'ab'));
+        if ($fresh === false) {
+            return;
+        }
+
+        $identity = self::streamIdentity($fresh);
+        if ($identity === null || $identity === $this->sinkIdentity) {
+            self::capturingErrors(static fn () => fclose($fresh));
+
+            return;
+        }
+
+        $old = $this->sinkStream;
+        $this->sinkStream = $fresh;
+        $this->sinkIdentity = $identity;
+        self::capturingErrors(static fn () => fclose($old));
+    }
+
+    /**
+     * @param resource $stream
+     * @return array{0: int, 1: int}|null (dev, inode), or null when unknown.
+     */
+    private static function streamIdentity($stream): ?array
+    {
+        [$stat] = self::capturingErrors(static fn () => fstat($stream));
+
+        return is_array($stat) ? [(int) $stat['dev'], (int) $stat['ino']] : null;
+    }
+
+    /** This logger's clock, or null when a caller-supplied one throws. */
+    private function sinkClockMs(): ?float
+    {
+        try {
+            return $this->clockMs();
+        } catch (\Throwable) {
+            return null;
+        }
+    }
+
+    /** `flush()` in stdout mode: flush the sink's stream, if one is open. */
+    private function flushSink(): void
+    {
+        try {
+            if (is_resource($this->sinkStream)) {
+                $stream = $this->sinkStream;
+                self::capturingErrors(static fn () => fflush($stream));
+            }
+        } catch (\Throwable) {
+            // flush() never throws.
+        }
+    }
+
+    /**
+     * Counts one line lost to the sink, and reports it — at most once per
+     * {@see self::WRITE_FAILED_REPORT_INTERVAL_MS}; the report carries every
+     * loss since the last one, and `flush()` reports what is held back.
+     *
+     * A line the `onError` hook itself logged while handling a write failure
+     * is counted and left for the next report: reporting it now would call
+     * the hook again, forever, for as long as the sink keeps failing.
+     */
+    private function writeFailed(string $detail, ?\Throwable $cause): void
+    {
+        $this->droppedTotal++;
+        $this->writeLostTotal++;
+        $this->writeLostUnreported++;
+        $this->lastWriteFailure = $detail;
+        $this->lastWriteFailureCause = $cause;
+
+        if (isset($this->reportingWriteFailureIn[self::executionContext()])) {
+            return;
+        }
+        $now = $this->sinkClockMs();
+        if (
+            $now !== null
+            && $this->writeLostReportedAt !== null
+            && $now - $this->writeLostReportedAt < self::WRITE_FAILED_REPORT_INTERVAL_MS
+        ) {
+            return;
+        }
+        $this->reportUnreportedWriteFailures($now);
+    }
+
+    private function reportUnreportedWriteFailures(?float $now = null): void
+    {
+        $context = self::executionContext();
+        if ($this->writeLostUnreported === 0 || isset($this->reportingWriteFailureIn[$context])) {
+            return;
+        }
+        $count = $this->writeLostUnreported;
+        $this->writeLostUnreported = 0;
+        $this->writeLostReportedAt = $now ?? $this->sinkClockMs();
+
+        $this->reportingWriteFailureIn[$context] = true;
+        try {
+            // The TypeScript SDK's lead-in for the same failure.
+            $this->report(new LoggerErrorEvent(
+                LoggerErrorEvent::REASON_WRITE_FAILED,
+                'Failed to write log: ' . $this->lastWriteFailure . ($count === 1 ? '' : sprintf(
+                    ' — %d lines lost since the last report, %d in total',
+                    $count,
+                    $this->writeLostTotal,
+                )),
+                $count,
+                $this->droppedTotal,
+                null,
+                null,
+                null,
+                $this->lastWriteFailureCause,
+            ));
+        } finally {
+            unset($this->reportingWriteFailureIn[$context]);
+        }
+    }
+
+    /**
+     * Stdout mode's `logRequest()` data: as the push path's, except that
+     * `headers` is omitted when the call supplied none (push writes `[]`), an
+     * empty map is written `{}`, and a header value equal to the app key is
+     * redacted.
+     *
+     * @param array<string, mixed> $request
+     * @return array<string, mixed>
+     */
+    private function stdoutRequestData(string $apiKey, array $request, string $correlationId): array
+    {
+        $data = ['method' => $request['method'], 'path' => $request['path']];
+        if (($request['headers'] ?? null) !== null) {
+            $data['headers'] = $this->stdoutHeaders($request['headers'], $apiKey);
+        }
+        $data['correlation_id'] = $correlationId;
+        if (array_key_exists('body', $request)) {
+            $data['body'] = $request['body'];
+        }
+
+        return $data;
+    }
+
+    /**
+     * Stdout mode's `logResponse()` data: `headers` and `body` are omitted when
+     * the call did not supply them (push writes both as null); an explicit
+     * `body: null` is written as null.
+     *
+     * @param array<string, mixed> $response
+     * @return array<string, mixed>
+     */
+    private function stdoutResponseData(string $apiKey, array $response): array
+    {
+        $data = ['status_code' => $response['statusCode']];
+        if (($response['headers'] ?? null) !== null) {
+            $data['headers'] = $this->stdoutHeaders($response['headers'], $apiKey);
+        }
+        if (array_key_exists('body', $response)) {
+            $data['body'] = $response['body'];
+        }
+        $data['duration_ms'] = $response['duration'];
+        $data['correlation_id'] = $response['correlationId'];
+
+        return $data;
+    }
+
+    /**
+     * Header redaction for a stdout line: by name, as on the push path, and
+     * also any VALUE exactly equal to the call's app key, whatever the header
+     * is called (spec § "What is, and is not, on a line"). A multi-value
+     * header (a list, as PSR-7 hands them) is checked per value.
+     *
+     * Returned as an object so an empty map is written `{}`, never `[]`, and
+     * a header named `"0"` stays a key rather than turning the map into a
+     * JSON list.
+     *
+     * @param array<array-key, mixed> $headers
+     */
+    private function stdoutHeaders(array $headers, string $apiKey): \stdClass
+    {
+        $redacted = [];
+        foreach ($headers as $name => $value) {
+            if (in_array(strtolower((string) $name), self::SENSITIVE_HEADERS, true)) {
+                $value = '[REDACTED]';
+            } elseif ($value === $apiKey) {
+                $value = '[REDACTED]';
+            } elseif (is_array($value)) {
+                foreach ($value as $i => $item) {
+                    if ($item === $apiKey) {
+                        $value[$i] = '[REDACTED]';
+                    }
+                }
+            }
+            $redacted[$name] = $value;
+        }
+
+        // The cast, not property assignment: it also carries a header named
+        // `""`, which `$object->{''}` cannot.
+        return (object) $redacted;
     }
 
     /**

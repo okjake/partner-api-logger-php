@@ -39,6 +39,23 @@ final class LoggerErrorEvent
     public const REASON_DRAIN_TIMEOUT = 'drain-timeout';
 
     /**
+     * Stdout mode (PAPI-5498): the sink refused the line — a callable sink
+     * threw, the stream could not be opened, or the write failed or was cut
+     * short. The lines are lost; `entryCount` is how many since the last
+     * such report (at most one a minute). The message starts
+     * `Failed to write log: `, as in the TypeScript SDK.
+     */
+    public const REASON_WRITE_FAILED = 'write-failed';
+
+    /**
+     * Stdout mode, PHP-only: reported once, when the logger is constructed,
+     * for a configuration that will most likely lose every line — today, a
+     * process-stdio sink (`php://stdout`, `php://stderr`) under PHP-FPM. No
+     * line has been lost yet; `entryCount` is 0.
+     */
+    public const REASON_SINK_WARNING = 'sink-warning';
+
+    /**
      * @param string          $reason       One of the REASON_* constants.
      * @param string          $message      Human-readable description; safe to log verbatim.
      * @param int             $entryCount   How many log entries this event cost you.

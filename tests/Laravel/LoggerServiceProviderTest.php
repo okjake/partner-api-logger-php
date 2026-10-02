@@ -149,21 +149,69 @@ final class LoggerServiceProviderTest extends TestCase
         $this->assertCount(1, $hooks, 'one process-wide shutdown hook, not one per request');
     }
 
+    /**
+     * PAPI-5498: stdout mode is a configuration change. `mode` and
+     * `stdout_sink` from config reach the logger the provider builds, the
+     * facade's call sites are unchanged, and the request's terminate() flush
+     * is harmless.
+     */
+    public function testConfigSwitchesTheProvidersLoggerToStdoutMode(): void
+    {
+        $sink = (string) tempnam(sys_get_temp_dir(), 'papi-5498-provider-');
+        try {
+            $app = $this->bootApp(captureLoggers: false, config: ['mode' => 'stdout', 'stdout_sink' => $sink]);
+
+            $app->make(Logger::class)->info(self::KEY, 'via config');
+            $app->terminate();
+
+            $written = (string) file_get_contents($sink);
+            $this->assertStringStartsWith('{"partnerapi_line":"1.6.0",', $written);
+            $this->assertStringContainsString('"message":"via config"', $written);
+            $this->assertSame(1, substr_count($written, "\n"));
+            $this->assertStringNotContainsString(self::KEY, $written);
+        } finally {
+            @unlink($sink);
+        }
+    }
+
+    /**
+     * env() turns PARTNER_API_LOG_STDOUT_SINK=true / false / null / empty into
+     * non-strings. None of that may break construction: the sink is passed
+     * only in stdout mode, and anything but a non-empty string there means
+     * the default.
+     */
+    public function testAMisSetStdoutSinkNeverBreaksTheLogger(): void
+    {
+        $push = $this->bootApp(captureLoggers: false, config: ['stdout_sink' => 'php://output'])->make(Logger::class);
+        $this->assertSame('buffered', $push->__debugInfo()['mode'], 'push mode ignores the sink setting');
+
+        foreach ([true, false, null, '', '  '] as $value) {
+            $logger = $this->bootApp(captureLoggers: false, config: ['mode' => 'stdout', 'stdout_sink' => $value])
+                ->make(Logger::class);
+            $this->assertSame('php://stdout', $logger->__debugInfo()['stdoutSink'], var_export($value, true));
+        }
+    }
+
     // ------------------------------------------------------------------- helpers
 
     /**
      * A booted app with the provider registered. With `$captureLoggers` the
      * provider's Logger binding is replaced by one that posts to a recording
      * ingest double — same singleton shape, resolved by the same container —
-     * so a drain is observable as a POST.
+     * so a drain is observable as a POST. `$config` adds `partner-logger`
+     * config keys.
      *
      * @param array<string, mixed> $loggerOptions
+     * @param array<string, mixed> $config
      */
-    private function bootApp(array $loggerOptions = [], bool $captureLoggers = true): FoundationApplication
-    {
+    private function bootApp(
+        array $loggerOptions = [],
+        bool $captureLoggers = true,
+        array $config = [],
+    ): FoundationApplication {
         $app = new FoundationApplication();
         $app->instance('config', new Repository([
-            'partner-logger' => ['tenant_token' => 'tenant-token', 'base_url' => 'https://ingest.test'],
+            'partner-logger' => ['tenant_token' => 'tenant-token', 'base_url' => 'https://ingest.test'] + $config,
         ]));
         $app->register(LoggerServiceProvider::class);
 

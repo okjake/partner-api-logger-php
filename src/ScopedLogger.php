@@ -43,6 +43,12 @@ final class ScopedLogger extends Logger
     {
     }
 
+    /** The root logger's, which never shows the token or app keys. */
+    public function __debugInfo(): array
+    {
+        return ['scoped' => true] + $this->root->__debugInfo();
+    }
+
     public function setContext(array $fields): void
     {
         $this->root->withScope($this->scope, fn () => $this->root->setContext($fields));

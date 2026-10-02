@@ -14,23 +14,35 @@ class LoggerServiceProvider extends ServiceProvider
 
         $this->app->singleton(Logger::class, function ($app) {
             $config = $app['config']['partner-logger'];
+            $mode = $config['mode'] ?? Logger::MODE_BUFFERED;
+
+            $options = [
+                'mode' => $mode,
+                'batchSize' => (int) ($config['batch_size'] ?? 100),
+                'maxBufferSize' => (int) ($config['max_buffer_size'] ?? 1000),
+                'maxRetries' => (int) ($config['max_retries'] ?? 3),
+                'retryBaseDelayMs' => (int) ($config['retry_base_delay_ms'] ?? 200),
+                'retryMaxDelayMs' => (int) ($config['retry_max_delay_ms'] ?? 5000),
+                'requestTimeoutMs' => (int) ($config['request_timeout_ms'] ?? 5000),
+                'autoDrainTimeoutMs' => (int) ($config['auto_drain_timeout_ms'] ?? 1000),
+                'drainDeadlineMs' => (int) ($config['drain_deadline_ms'] ?? 5000),
+                'flushOnShutdown' => (bool) ($config['flush_on_shutdown'] ?? true),
+                'finishRequestOnShutdown' => (bool) ($config['finish_request_on_shutdown'] ?? true),
+            ];
+
+            // Passed only in stdout mode, so a mis-set PARTNER_API_LOG_STDOUT_SINK
+            // can never fail construction of a push-mode logger. env() turns
+            // `true` / `false` / `null` / `empty` into non-strings: anything
+            // but a non-empty string means the default.
+            if ($mode === Logger::MODE_STDOUT) {
+                $sink = $config['stdout_sink'] ?? null;
+                $options['stdoutSink'] = is_string($sink) && trim($sink) !== '' ? $sink : 'php://stdout';
+            }
 
             return new Logger(
                 tenantToken: $config['tenant_token'],
                 baseUrl: $config['base_url'] ?? null,
-                options: [
-                    'mode' => $config['mode'] ?? Logger::MODE_BUFFERED,
-                    'batchSize' => (int) ($config['batch_size'] ?? 100),
-                    'maxBufferSize' => (int) ($config['max_buffer_size'] ?? 1000),
-                    'maxRetries' => (int) ($config['max_retries'] ?? 3),
-                    'retryBaseDelayMs' => (int) ($config['retry_base_delay_ms'] ?? 200),
-                    'retryMaxDelayMs' => (int) ($config['retry_max_delay_ms'] ?? 5000),
-                    'requestTimeoutMs' => (int) ($config['request_timeout_ms'] ?? 5000),
-                    'autoDrainTimeoutMs' => (int) ($config['auto_drain_timeout_ms'] ?? 1000),
-                    'drainDeadlineMs' => (int) ($config['drain_deadline_ms'] ?? 5000),
-                    'flushOnShutdown' => (bool) ($config['flush_on_shutdown'] ?? true),
-                    'finishRequestOnShutdown' => (bool) ($config['finish_request_on_shutdown'] ?? true),
-                ],
+                options: $options,
             );
         });
     }

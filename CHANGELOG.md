@@ -2,6 +2,65 @@
 
 # Changelog
 
+## 2.2.0
+
+Stdout mode: the logger can write each log call as one JSON line for your own
+log pipeline (an OpenTelemetry Collector, Fluent Bit, Vector) to deliver,
+instead of sending it (PAPI-5498). It implements the pipeline profile of the
+logger spec 1.6.0. Nothing changes unless you select it.
+
+### Added
+
+- **`Logger::MODE_STDOUT` (`'mode' => 'stdout'`, or
+  `PARTNER_API_LOG_MODE=stdout` under Laravel).** Every `info` / `warn` /
+  `error` / `debug` / `logRequest` / `logResponse` writes one line that starts
+  with `{"partnerapi_line":"1.6.0",`, followed by the envelope
+  (`partnerapi_partner_ref`, `partnerapi_timestamp`, `partnerapi_level` and,
+  when set, direction and upstream attribution) and then the same fields the
+  push path sends. Call sites, the facade, context, request scopes and the
+  upstream trail are unchanged. A log call performs no network I/O, no
+  buffering and no retries; `flush()`, `shutdown()` and `close()` only flush
+  the stream. `metric()` / `metrics()` still post. Construction throws
+  `LoggerException` in this mode when `tenantToken` is empty, since every
+  reference is derived from it.
+- **The line names the partner by a reference, never by the app key:**
+  `v1:` + HMAC-SHA256 (keyed with the tenant token) of the key's SHA-256.
+  `PartnerApi\Logger\PartnerReference::v1($tenantToken, $appKey)` computes it
+  for applications that write the line from their own logger.
+- **`stdoutSink` option** (`stdout_sink` / `PARTNER_API_LOG_STDOUT_SINK` under
+  Laravel, passed only in stdout mode; default `php://stdout`): `php://stdout`,
+  `php://stderr`, `php://fd/<n>`, a `file://` URI or a local file path (use an
+  absolute one), opened in append mode; an open stream resource; or a callable
+  receiving each line. Each line is one `fwrite()`. Any other stream
+  (`php://output`, which under PHP-FPM would write log lines into the HTTP
+  response, `php://memory`, `http://`, …) throws at construction. A file sink
+  renamed or deleted by log rotation is reopened within a second, switching
+  only once the new file opens (until then the old file keeps receiving
+  lines); `copytruncate` needs nothing. Under PHP-FPM and under `octane:start` use a
+  file: FPM discards or splits worker output, and Octane re-renders it (see
+  the readme).
+- **In stdout mode a header whose value is exactly the app key is
+  redacted**, whatever the header is called, on top of the usual header-name
+  redaction. Caller data keys starting `partnerapi_` are dropped. Bodies and
+  other data pass through your pipeline as given; ingest sanitises them on
+  arrival.
+- **`LoggerErrorEvent::REASON_WRITE_FAILED` (`write-failed`):** the sink
+  threw, could not be opened, or took less than the whole line. The message
+  starts `Failed to write log:`, as in the TypeScript SDK, and carries the OS
+  error (`Broken pipe`, `No space left on device`) where PHP raised one.
+  Reported at most once a minute with the count lost since the last report;
+  `stats()['dropped']` counts every line, and `flush()` reports what was held
+  back. The log call still never throws.
+- **`LoggerErrorEvent::REASON_SINK_WARNING` (`sink-warning`):** reported once
+  when a stdout-mode logger is constructed under PHP-FPM with `php://stdout` or
+  `php://stderr` as its sink. That is once per logger instance: under FPM, where
+  each request builds its own logger, once per request with the default hook.
+- **`Logger::__debugInfo()`:** `var_dump()` and `print_r()` no longer show the
+  tenant token or the app keys a logger holds, in any mode.
+
+An already-published `config/partner-logger.php` keeps working: the new key
+falls back to the package default.
+
 ## 2.1.1
 
 Fixes the end-of-request drain on Laravel Octane and a memory leak on every
